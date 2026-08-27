@@ -30,7 +30,7 @@ unzip -t "$apk" | tee "$report_dir/zip-integrity.txt"
   | tee "$report_dir/manifest-tree.txt"
 
 grep -Fq "package: name='$expected_package'" "$report_dir/badging.txt"
-grep -Fq "sdkVersion:'26'" "$report_dir/badging.txt"
+grep -Fq "minSdkVersion:'26'" "$report_dir/badging.txt"
 grep -Fq "targetSdkVersion:'36'" "$report_dir/badging.txt"
 grep -Fq "launchable-activity: name='jp.rstlab.batteryrelay.MainActivity'" \
   "$report_dir/badging.txt"
