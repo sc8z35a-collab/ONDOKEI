@@ -98,11 +98,8 @@ if [[ -n "$release_keystore" ]]; then
   key_password="$BATTERY_RELAY_KEY_PASSWORD"
   output="$project_dir/dist/BatteryRelay-1.3.1.apk"
 else
-  # Development builds intentionally use a separate identity and filename. Losing this keystore
-  # only affects dev APK updates and can never silently create a fake replacement release key.
   keystore="$project_dir/.dev-signing.jks"
   store_password="${BATTERY_RELAY_DEV_STORE_PASSWORD:-batteryrelay-dev}"
-  # Keep the historical alias so existing .dev-signing.jks files remain usable after upgrading.
   key_alias="${BATTERY_RELAY_DEV_KEY_ALIAS:-battery-relay}"
   key_password="${BATTERY_RELAY_DEV_KEY_PASSWORD:-$store_password}"
   if [[ ! -f "$keystore" ]]; then
@@ -115,11 +112,18 @@ else
 fi
 
 rm -f -- "$output" "$output.idsig"
-"$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias "$key_alias" \
-  --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true \
-  --v4-signing-enabled false \
-  --ks-pass "pass:$store_password" --key-pass "pass:$key_password" \
-  --out "$output" "$build_dir/aligned.apk"
+# apksigner supports env: password sources. Keep long-lived signing passwords out of the process
+# command line so they are not exposed by process listings or diagnostic command capture.
+(
+  export BATTERY_RELAY_APKSIGNER_STORE_PASSWORD="$store_password"
+  export BATTERY_RELAY_APKSIGNER_KEY_PASSWORD="$key_password"
+  "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias "$key_alias" \
+    --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true \
+    --v4-signing-enabled false \
+    --ks-pass env:BATTERY_RELAY_APKSIGNER_STORE_PASSWORD \
+    --key-pass env:BATTERY_RELAY_APKSIGNER_KEY_PASSWORD \
+    --out "$output" "$build_dir/aligned.apk"
+)
 if [[ -e "$output.idsig" ]]; then
   unlink "$output.idsig"
 fi
