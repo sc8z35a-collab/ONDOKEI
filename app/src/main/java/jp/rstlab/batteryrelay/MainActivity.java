@@ -40,8 +40,8 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import jp.rstlab.batteryrelay.core.TrendMath;
 import jp.rstlab.batteryrelay.core.SamplingPolicy;
+import jp.rstlab.batteryrelay.core.TrendMath;
 import jp.rstlab.batteryrelay.data.MeasurementRepository;
 import jp.rstlab.batteryrelay.model.BatterySample;
 import jp.rstlab.batteryrelay.model.RemoteSnapshot;
@@ -55,6 +55,7 @@ import jp.rstlab.batteryrelay.ui.Ui;
 
 public final class MainActivity extends android.app.Activity {
     private static final int REQUEST_NOTIFICATIONS = 41;
+    private static final long FUTURE_CLOCK_TOLERANCE_MILLIS = 5_000L;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService uiIo = Executors.newSingleThreadExecutor(r -> {
@@ -130,6 +131,10 @@ public final class MainActivity extends android.app.Activity {
                                         Toast.LENGTH_SHORT).show();
                             }
                         }
+                    } else {
+                        // Pairing/recovery can change connected state before the first snapshot.
+                        // Re-render so the pill never claims a disconnected peer is connected.
+                        render();
                     }
                 }
 
@@ -400,7 +405,7 @@ public final class MainActivity extends android.app.Activity {
 
     private static String compactDeviceName(String value) {
         String name = value == null ? "共有端末" : value
-                .replaceFirst("(?i)^Battery Relay\\s*-\\s*", "").trim();
+                .replaceFirst("(?i)^Battery Relay\s*-\s*", "").trim();
         int count = name.codePointCount(0, name.length());
         if (count <= 18) return name;
         int end = name.offsetByCodePoints(0, 17);
@@ -456,10 +461,10 @@ public final class MainActivity extends android.app.Activity {
         sendMonitorCommand(MonitorService.ACTION_SET_TURBO, enabled);
         render();
         String message = enabled && isLocalProtectionActive()
-                ? "Turboオン（省電力・重度熱状態では保護60秒）"
+                ? remoteMode ? "Turboオン（この端末の省電力・熱保護で受信60秒）"
+                : "Turboオン（省電力・重度熱状態では保護60秒）"
                 : enabled ? "Turbo：5秒更新" : "標準：15秒更新";
-        Toast.makeText(this, message,
-                Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
 
     private void sendMonitorCommand(String action, boolean turboValue) {
@@ -602,7 +607,7 @@ public final class MainActivity extends android.app.Activity {
         clock.setGravity(Gravity.CENTER);
         note.addView(clock, new LinearLayout.LayoutParams(Ui.dp(this, 42), -2));
         TextView text = Ui.text(this,
-                "保存上限は30分。古い測定値は端末内DBから自動で削除され、共有先にも送られません。",
+                "画面と共有は直近30分だけ。端末内DBも最大31点に制限し、時計ずれ保護で一時保持した30分外の値は表示・共有しません。",
                 12.5f, Ui.text(this), false);
         text.setLineSpacing(0f, 1.18f);
         note.addView(text, new LinearLayout.LayoutParams(0, -2, 1f));
@@ -654,14 +659,31 @@ public final class MainActivity extends android.app.Activity {
     }
 
     private void render() {
-        boolean protectedMode = isLocalProtectionActive();
+        boolean localProtection = isLocalProtectionActive();
         boolean samplingActive = repository.isSamplingActive();
-        statusPill.setText(!remoteMode && !samplingActive ? "停止中" : remoteMode
-                ? protectedMode ? "接続中・保護60秒"
-                : turboMode ? "接続中・5秒" : "接続中・15秒"
-                : protectedMode ? "保護・60秒" : turboMode ? "Turbo・5秒" : "計測中・15秒");
-        statusPill.setTextColor(!samplingActive && !remoteMode ? Ui.subtext(this)
-                : remoteMode ? Ui.slate(this) : Ui.success(this));
+        RemoteDeviceManager.Device selected = remoteMode ? findDevice(selectedRemoteKey) : null;
+        boolean remoteConnected = selected != null && selected.connected;
+        String status;
+        if (!remoteMode) {
+            status = !samplingActive ? "停止中"
+                    : localProtection ? "保護・60秒"
+                    : turboMode ? "Turbo・5秒" : "計測中・15秒";
+        } else if (!remoteConnected) {
+            status = "再接続中";
+        } else if (localProtection) {
+            status = "受信保護・60秒";
+        } else {
+            status = turboMode ? "接続中・5秒" : "接続中・15秒";
+        }
+        statusPill.setText(status);
+        statusPill.setTextColor(!remoteMode && !samplingActive ? Ui.subtext(this)
+                : remoteMode ? remoteConnected ? Ui.slate(this) : Ui.subtext(this)
+                : Ui.success(this));
+        if (shareButton != null) {
+            shareButton.setText(shareHost != null && shareHost.isRunning()
+                    ? "共有中・設定を開く" : "この端末の情報を共有");
+        }
+
         BatterySample latest = displayedSamples.isEmpty() ? null
                 : displayedSamples.get(displayedSamples.size() - 1);
         if (latest == null) {
@@ -694,7 +716,10 @@ public final class MainActivity extends android.app.Activity {
             chargingValue.setText(latest.charging ? "充電中" : "バッテリー");
             thermalValue.setText(thermalLabel(latest.thermalStatus));
         }
-        long chartTime = remoteMode ? displayedGeneratedAt : System.currentTimeMillis();
+
+        // Remote sample timestamps are mapped to this device's wall clock. Anchoring the chart to
+        // actual current time makes stale/disconnected data move left instead of staying at "今".
+        long chartTime = System.currentTimeMillis();
         batteryChart.setData(displayedSamples, TrendMath.Metric.BATTERY_PERCENT,
                 Ui.terracotta(this), chartTime);
         temperatureChart.setData(displayedSamples, TrendMath.Metric.TEMPERATURE_C,
@@ -714,9 +739,7 @@ public final class MainActivity extends android.app.Activity {
         boolean powerSave = false;
         try {
             powerSave = power != null && power.isPowerSaveMode();
-        } catch (RuntimeException ignored) {
-            // Broken vendor PowerManager implementations must not crash the UI.
-        }
+        } catch (RuntimeException ignored) {}
         BatterySample latest = localSamples.isEmpty() ? null
                 : localSamples.get(localSamples.size() - 1);
         return powerSave || latest != null
@@ -733,7 +756,12 @@ public final class MainActivity extends android.app.Activity {
             freshness.setText("データ待機中");
             return;
         }
-        long seconds = Math.max(0L, (System.currentTimeMillis() - base) / 1000L);
+        long now = System.currentTimeMillis();
+        if (base > now && base - now > FUTURE_CLOCK_TOLERANCE_MILLIS) {
+            freshness.setText("端末時刻に差があります");
+            return;
+        }
+        long seconds = Math.max(0L, (now - base) / 1000L);
         if (seconds < 5) freshness.setText("たった今更新");
         else if (seconds < 60) freshness.setText(String.format(Locale.JAPAN, "%d秒前に更新", seconds));
         else freshness.setText(String.format(Locale.JAPAN, "%d分前に更新", seconds / 60));
@@ -741,11 +769,15 @@ public final class MainActivity extends android.app.Activity {
 
     private void showHostDialog() {
         Dialog dialog = baseDialog();
+        // Sharing persists after the dialog is closed. Do not let an outside tap/back gesture hide
+        // that fact; the user must explicitly choose "continue sharing" or "stop sharing".
+        dialog.setCanceledOnTouchOutside(false);
+        dialog.setCancelable(false);
         LinearLayout content = dialogContent();
         TextView title = Ui.text(this, "この端末から共有", 21f, Ui.text(this), true);
         content.addView(title);
         TextView description = Ui.text(this,
-                "もう1台も同じWi‑Fiに接続し、画面上部の「＋ 端末」からこの端末を選びます。",
+                "もう1台も同じWi‑Fiに接続し、画面上部の「＋ 端末」からこの端末を選びます。閉じても共有は継続します。",
                 13f, Ui.subtext(this), false);
         description.setLineSpacing(0f, 1.2f);
         content.addView(description, marginParams(-1, -2, 8, 18));
@@ -767,11 +799,18 @@ public final class MainActivity extends android.app.Activity {
         Ui.styleButton(refresh, false);
         refresh.setOnClickListener(v -> shareHost.refreshPairingCode());
         content.addView(refresh, marginParams(-1, Ui.dp(this, 50), 0, 8));
+
+        TextView closeKeep = Ui.text(this, "共有を継続して閉じる", 14f, Ui.text(this), true);
+        Ui.styleButton(closeKeep, false);
+        closeKeep.setOnClickListener(v -> dialog.dismiss());
+        content.addView(closeKeep, marginParams(-1, Ui.dp(this, 50), 0, 8));
+
         TextView stop = Ui.text(this, "共有を停止", 14f, Ui.canvas(this), true);
         Ui.styleButton(stop, true);
         stop.setOnClickListener(v -> {
             shareHost.stop();
             dialog.dismiss();
+            if (shareButton != null) shareButton.setText("この端末の情報を共有");
             Toast.makeText(this, "共有を停止し、接続鍵を破棄しました", Toast.LENGTH_SHORT).show();
         });
         content.addView(stop, marginParams(-1, Ui.dp(this, 50), 0, 10));
@@ -786,6 +825,7 @@ public final class MainActivity extends android.app.Activity {
         shareHost.setListener((running, pairingCode, viewers, error) -> {
             if (!dialog.isShowing()) return;
             if (running && pairingCode.length() == 26) {
+                if (shareButton != null) shareButton.setText("共有中・設定を開く");
                 code.setText(groupSecret(pairingCode));
                 code.setOnClickListener(v -> {
                     ClipboardManager clipboard = getSystemService(ClipboardManager.class);
@@ -815,14 +855,22 @@ public final class MainActivity extends android.app.Activity {
                 try {
                     shareHost.start();
                 } catch (IOException | GeneralSecurityException error) {
-                    mainHandler.post(() -> state.setText(String.format(Locale.JAPAN,
-                            "共有を開始できません: %s", safeMessage(error))));
+                    mainHandler.post(() -> {
+                        if (!isDestroyed() && dialog.isShowing()) {
+                            state.setText(String.format(Locale.JAPAN,
+                                    "共有を開始できません: %s", safeMessage(error)));
+                        }
+                    });
                 }
             });
         }
     }
 
     private void showDiscoveryDialog() {
+        if (browser != null) {
+            Toast.makeText(this, "端末を検索中です", Toast.LENGTH_SHORT).show();
+            return;
+        }
         Dialog dialog = baseDialog();
         LinearLayout content = dialogContent();
         content.addView(Ui.text(this, "端末を追加", 21f, Ui.text(this), true));
@@ -966,9 +1014,7 @@ public final class MainActivity extends android.app.Activity {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) clipboard.clearPrimaryClip();
                 else clipboard.setPrimaryClip(ClipData.newPlainText("", ""));
             }
-        } catch (RuntimeException ignored) {
-            // Clipboard access can be revoked when the app is no longer foreground.
-        }
+        } catch (RuntimeException ignored) {}
     }
 
     private Dialog baseDialog() {
