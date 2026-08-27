@@ -88,11 +88,20 @@ jobs:
           heap-size: 768M
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
+            collect_emulator_artifacts() {
+              mkdir -p artifacts/api-${{ matrix.api-level }}/final
+              timeout 15s adb logcat -d -v threadtime > artifacts/api-${{ matrix.api-level }}/final/logcat.txt 2>&1 || true
+              timeout 15s adb logcat -b crash -d -v threadtime > artifacts/api-${{ matrix.api-level }}/final/logcat-crash.txt 2>&1 || true
+              timeout 15s adb shell dumpsys activity services jp.rstlab.batteryrelay.debug > artifacts/api-${{ matrix.api-level }}/final/services.txt 2>&1 || true
+              timeout 15s adb shell dumpsys meminfo jp.rstlab.batteryrelay.debug > artifacts/api-${{ matrix.api-level }}/final/meminfo.txt 2>&1 || true
+              timeout 15s adb exec-out screencap -p > artifacts/api-${{ matrix.api-level }}/final/final-screen.png 2>/dev/null || true
+            }
+            trap collect_emulator_artifacts EXIT
             mkdir -p artifacts/api-${{ matrix.api-level }}/instrumentation
             adb install -r -t downloaded/apks/app-debug.apk
             adb install -r -t downloaded/apks/app-debug-androidTest.apk
             adb shell pm grant jp.rstlab.batteryrelay.debug android.permission.POST_NOTIFICATIONS || true
-            adb shell am instrument -w -r \
+            timeout --foreground 12m adb shell am instrument -w -r \
               -e disableAnalytics true \
               jp.rstlab.batteryrelay.debug.test/androidx.test.runner.AndroidJUnitRunner \
               | tee artifacts/api-${{ matrix.api-level }}/instrumentation/instrumentation.txt
@@ -100,15 +109,16 @@ jobs:
               | grep -Eq '^OK \([0-9]+ tests?\)$'
             scripts/ci/emulator-scenario.sh \
               downloaded/apks/app-debug.apk artifacts/api-${{ matrix.api-level }}/scenario
-      - name: Collect final logs and screenshot even after failure
+            collect_emulator_artifacts
+            trap - EXIT
+      - name: Confirm failure diagnostics were collected before emulator shutdown
         if: always()
         run: |
           mkdir -p artifacts/api-${{ matrix.api-level }}/final
-          adb logcat -d -v threadtime > artifacts/api-${{ matrix.api-level }}/final/logcat.txt 2>&1 || true
-          adb logcat -b crash -d -v threadtime > artifacts/api-${{ matrix.api-level }}/final/logcat-crash.txt 2>&1 || true
-          adb shell dumpsys activity services jp.rstlab.batteryrelay.debug > artifacts/api-${{ matrix.api-level }}/final/services.txt 2>&1 || true
-          adb shell dumpsys meminfo jp.rstlab.batteryrelay.debug > artifacts/api-${{ matrix.api-level }}/final/meminfo.txt 2>&1 || true
-          adb exec-out screencap -p > artifacts/api-${{ matrix.api-level }}/final/final-screen.png 2>/dev/null || true
+          if [ ! -s artifacts/api-${{ matrix.api-level }}/final/logcat.txt ]; then
+            printf '%s\n' 'Emulator stopped before logcat could be collected.' \
+              > artifacts/api-${{ matrix.api-level }}/final/collection-note.txt
+          fi
       - name: Upload API ${{ matrix.api-level }} audit artifacts
         if: always()
         uses: actions/upload-artifact@v4
