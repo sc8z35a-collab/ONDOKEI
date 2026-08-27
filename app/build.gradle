@@ -2,6 +2,12 @@ plugins {
     id 'com.android.application'
 }
 
+def releaseKeystore = System.getenv('BATTERY_RELAY_RELEASE_KEYSTORE')
+def releaseStorePassword = System.getenv('BATTERY_RELAY_STORE_PASSWORD')
+def releaseKeyAlias = System.getenv('BATTERY_RELAY_KEY_ALIAS')
+def releaseKeyPassword = System.getenv('BATTERY_RELAY_KEY_PASSWORD')
+def releaseSigningReady = releaseKeystore && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
 android {
     namespace 'jp.rstlab.batteryrelay'
     compileSdk 36
@@ -10,20 +16,22 @@ android {
         applicationId 'jp.rstlab.batteryrelay'
         minSdk 26
         targetSdk 36
-        versionCode 4
-        versionName '1.3.0'
+        versionCode 5
+        versionName '1.3.1'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     signingConfigs {
-        release {
-            storeFile file('../.dev-signing.jks')
-            storePassword System.getenv('BATTERY_RELAY_STORE_PASSWORD') ?: 'batteryrelay-dev'
-            keyAlias System.getenv('BATTERY_RELAY_KEY_ALIAS') ?: 'battery-relay'
-            keyPassword System.getenv('BATTERY_RELAY_KEY_PASSWORD') ?: storePassword
-            enableV1Signing false
-            enableV2Signing true
-            enableV3Signing true
+        if (releaseSigningReady) {
+            release {
+                storeFile rootProject.file(releaseKeystore)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                enableV1Signing false
+                enableV2Signing true
+                enableV3Signing true
+            }
         }
     }
 
@@ -33,7 +41,9 @@ android {
             versionNameSuffix '-debug'
         }
         release {
-            signingConfig signingConfigs.release
+            if (releaseSigningReady) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
@@ -49,13 +59,26 @@ android {
     lint {
         abortOnError true
         checkReleaseBuilds true
-        // API 36 is intentional: AGP 8.13's supported maximum and Android 17
-        // grants target-36 apps local-network access through INTERNET compatibility.
+        // API 36 is intentional: AGP 8.13's supported maximum. ACCESS_LOCAL_NETWORK is declared
+        // now so the manifest is ready for Android 17; runtime requesting is required when the
+        // project eventually moves targetSdk to 37+.
         disable 'GradleDependency', 'OldTargetApi'
     }
 
     testOptions {
         animationsDisabled true
+    }
+}
+
+// Never silently mint a new "release" identity. A release package must use the long-lived key
+// supplied by the operator, otherwise Android correctly refuses it as an update to prior builds.
+tasks.configureEach { task ->
+    if (task.name.toLowerCase().matches('.*(assemble|bundle|package).*release.*')) {
+        task.doFirst {
+            if (!releaseSigningReady) {
+                throw new GradleException('Release signing is not configured. Set BATTERY_RELAY_RELEASE_KEYSTORE, BATTERY_RELAY_STORE_PASSWORD, BATTERY_RELAY_KEY_ALIAS and BATTERY_RELAY_KEY_PASSWORD.')
+            }
+        }
     }
 }
 
