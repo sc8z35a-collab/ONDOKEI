@@ -12,6 +12,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.CopyOnWriteArraySet;
 
@@ -33,27 +34,46 @@ public final class MeasurementRepository {
     private volatile boolean samplingActive;
     private long lastSampleElapsed = Long.MIN_VALUE;
     private final AtomicLong sampleRevision = new AtomicLong();
+    private final long timelineWallAnchor;
+    private final long timelineElapsedAnchor;
 
     public MeasurementRepository(Context context) {
         reader = new BatteryReader(context);
         store = new HistoryStore(context);
+        timelineWallAnchor = System.currentTimeMillis();
+        timelineElapsedAnchor = SystemClock.elapsedRealtime();
+    }
+
+    /** Loads/prunes persisted state away from the Android main thread. */
+    public void initializeAsync(Executor executor) {
+        if (executor == null) return;
+        executor.execute(this::initialize);
     }
 
     public synchronized void initialize() {
+        long now = timelineNow();
         try {
-            cached = store.readWindow(System.currentTimeMillis());
-            if (!cached.isEmpty()) {
-                lastPersistedMinute = Math.floorDiv(
-                        cached.get(cached.size() - 1).timestampMillis, 60_000L);
+            List<BatterySample> loaded = store.readWindow(now);
+            if (liveSample != null) {
+                cached = jp.rstlab.batteryrelay.core.TrendMath.upsertMinuteSample(
+                        loaded, liveSample, now);
+                lastPersistedMinute = Math.floorDiv(liveSample.timestampMillis, 60_000L);
+            } else {
+                cached = loaded;
+                if (!cached.isEmpty()) {
+                    lastPersistedMinute = Math.floorDiv(
+                            cached.get(cached.size() - 1).timestampMillis, 60_000L);
+                }
             }
         } catch (RuntimeException databaseFailure) {
-            // Live monitoring and encrypted sharing must remain usable if storage is full/corrupt.
-            cached = Collections.emptyList();
+            // Never overwrite live in-memory data because storage is temporarily unavailable.
+            cached = jp.rstlab.batteryrelay.core.TrendMath.retainWindow(cached, now);
         }
+        notifyListeners(cached);
     }
 
     public synchronized BatterySample sampleNow() {
-        long now = System.currentTimeMillis();
+        long now = timelineNow();
         BatterySample sample = reader.read(now);
         lastSampleElapsed = SystemClock.elapsedRealtime();
         long minute = Math.floorDiv(sample.timestampMillis, 60_000L);
@@ -85,7 +105,7 @@ public final class MeasurementRepository {
     }
 
     public synchronized void pruneNow() {
-        long now = System.currentTimeMillis();
+        long now = timelineNow();
         try {
             cached = store.readWindow(now);
         } catch (RuntimeException ignored) {
@@ -117,7 +137,7 @@ public final class MeasurementRepository {
     /** Flushes the latest minute on an explicit service stop without changing the live cache. */
     public synchronized void flushPending() {
         if (pendingPersistentSample != null) enqueueForPersistence(pendingPersistentSample);
-        if (flushBacklog(System.currentTimeMillis())) pendingPersistentSample = null;
+        if (flushBacklog(timelineNow())) pendingPersistentSample = null;
     }
 
     public void setSamplingActive(boolean active) {
@@ -126,9 +146,12 @@ public final class MeasurementRepository {
     }
 
     public void addListener(Listener listener) {
+        if (listener == null) return;
         listeners.add(listener);
         List<BatterySample> copy = cached;
-        mainHandler.post(() -> listener.onMeasurementsChanged(copy));
+        mainHandler.post(() -> {
+            if (listeners.contains(listener)) listener.onMeasurementsChanged(copy);
+        });
     }
 
     public void removeListener(Listener listener) {
@@ -160,5 +183,15 @@ public final class MeasurementRepository {
             // Retain the bounded backlog in memory and retry at the next minute boundary/stop.
             return false;
         }
+    }
+
+    /**
+     * Monotonic wall-like timeline. Manual/NTP wall-clock jumps during this process therefore do
+     * not make valid samples suddenly appear to be in the future or expire the whole 30-min window.
+     */
+    private long timelineNow() {
+        long delta = Math.max(0L, SystemClock.elapsedRealtime() - timelineElapsedAnchor);
+        if (timelineWallAnchor > Long.MAX_VALUE - delta) return Long.MAX_VALUE;
+        return timelineWallAnchor + delta;
     }
 }
