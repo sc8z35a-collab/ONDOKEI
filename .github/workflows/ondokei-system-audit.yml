@@ -69,6 +69,11 @@ jobs:
           path: downloaded
       - name: Restore executable bits
         run: chmod +x scripts/ci/*.sh
+      - name: Enable hardware acceleration for the Android Emulator
+        run: |
+          test -e /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
       - name: Cache emulator AVD
         uses: actions/cache@v4
         with:
