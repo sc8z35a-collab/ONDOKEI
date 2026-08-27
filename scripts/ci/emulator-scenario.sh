@@ -23,6 +23,12 @@ assert_activity() {
   grep -Fq "$package/$activity" "$report_dir/activities.txt"
 }
 
+assert_sampler_wakelock() {
+  local output="$1"
+  adb shell dumpsys power > "$output"
+  grep -Fq 'BatteryRelay:ContinuousSampling' "$output"
+}
+
 adb wait-for-device
 adb logcat -c || true
 adb logcat -b crash -c || true
@@ -55,6 +61,7 @@ adb shell dumpsys activity services "$package" > "$report_dir/services-foregroun
 grep -Fq 'MonitorService' "$report_dir/services-foreground.txt"
 grep -Eq 'isForeground=true|foregroundServiceType|foregroundId=' \
   "$report_dir/services-foreground.txt"
+assert_sampler_wakelock "$report_dir/power-foreground.txt"
 
 adb shell settings put system accelerometer_rotation 0
 adb shell settings put system user_rotation 1
@@ -68,6 +75,7 @@ sleep 2
 assert_alive
 adb shell dumpsys activity services "$package" > "$report_dir/services-background.txt"
 grep -Fq 'MonitorService' "$report_dir/services-background.txt"
+assert_sampler_wakelock "$report_dir/power-background.txt"
 adb shell am start -W -n "$package/$activity" > "$report_dir/background-return.txt"
 sleep 2
 assert_activity
@@ -93,6 +101,7 @@ adb shell am start -W -n "$package/$activity" | tee "$report_dir/process-restart
 sleep 3
 assert_alive
 assert_activity
+assert_sampler_wakelock "$report_dir/power-after-restart.txt"
 snapshot "07-process-restart"
 
 adb shell dumpsys meminfo "$package" > "$report_dir/meminfo.txt"
@@ -107,5 +116,5 @@ if grep -Eq "Process: $package|Cmdline: $package|ANR in $package" \
   exit 1
 fi
 
-echo "Emulator lifecycle, service, permission, rotation, network, restart and low-memory scenario passed" \
+echo "Emulator lifecycle, service, wake-lock, permission, rotation, network, restart and low-memory scenario passed" \
   | tee "$report_dir/result.txt"
