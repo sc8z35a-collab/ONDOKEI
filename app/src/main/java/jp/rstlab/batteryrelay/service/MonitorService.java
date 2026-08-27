@@ -40,6 +40,7 @@ public final class MonitorService extends Service {
     private MeasurementRepository repository;
     private NotificationManager notificationManager;
     private PowerManager powerManager;
+    private PowerManager.WakeLock samplingWakeLock;
     private volatile boolean sampling;
     private volatile boolean turbo;
     private boolean foregroundStarted;
@@ -72,6 +73,11 @@ public final class MonitorService extends Service {
         repository = BatteryRelayApp.from(this).repository();
         notificationManager = getSystemService(NotificationManager.class);
         powerManager = getSystemService(PowerManager.class);
+        if (powerManager != null) {
+            samplingWakeLock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK, "BatteryRelay:ContinuousSampling");
+            samplingWakeLock.setReferenceCounted(false);
+        }
         turbo = false;
         createNotificationChannel();
         workerThread = new HandlerThread("battery-relay-sampler", Process.THREAD_PRIORITY_BACKGROUND);
@@ -114,6 +120,7 @@ public final class MonitorService extends Service {
         if (!sampling) {
             sampling = true;
             samplingGeneration++;
+            acquireSamplingWakeLock();
             repository.setSamplingActive(true);
             worker.removeCallbacks(sampleTask);
             worker.post(sampleTask);
@@ -146,9 +153,30 @@ public final class MonitorService extends Service {
         samplingGeneration++;
         if (repository != null) {
             repository.setSamplingActive(false);
-            repository.flushPending();
+            BatteryRelayApp.from(this).executeIo(repository::flushPending);
         }
         if (worker != null) worker.removeCallbacksAndMessages(null);
+        releaseSamplingWakeLock();
+    }
+
+    private void acquireSamplingWakeLock() {
+        PowerManager.WakeLock lock = samplingWakeLock;
+        if (lock == null) return;
+        try {
+            if (!lock.isHeld()) lock.acquire();
+        } catch (RuntimeException ignored) {
+            // Sampling can still proceed while awake even on an OEM that rejects the lock.
+        }
+    }
+
+    private void releaseSamplingWakeLock() {
+        PowerManager.WakeLock lock = samplingWakeLock;
+        if (lock == null) return;
+        try {
+            if (lock.isHeld()) lock.release();
+        } catch (RuntimeException ignored) {
+            // Process death also releases kernel wakelocks; never crash during teardown.
+        }
     }
 
     private void createNotificationChannel() {
@@ -169,7 +197,11 @@ public final class MonitorService extends Service {
         } catch (RuntimeException ignored) {
             // A vendor service failure must not terminate the sampling worker.
         }
-        return SamplingPolicy.localInterval(turbo, powerSave, lastThermalStatus);
+        // Turbo belongs to the selected source. Keep the local sampler at Normal while a remote
+        // device is selected, then automatically resume local Turbo when the local tab is active.
+        boolean localTurbo = turbo
+                && BatteryRelayApp.from(this).remoteDevices().getActiveKey() == null;
+        return SamplingPolicy.localInterval(localTurbo, powerSave, lastThermalStatus);
     }
 
     private void maybeUpdateNotification(BatterySample sample) {
@@ -201,7 +233,8 @@ public final class MonitorService extends Service {
         }
         long interval = effectiveIntervalMillis();
         String mode = interval == SamplingPolicy.BACKGROUND_INTERVAL_MILLIS
-                ? "保護60秒" : turbo ? "Turbo 5秒" : "標準15秒";
+                ? "保護60秒" : interval == SamplingPolicy.TURBO_INTERVAL_MILLIS
+                ? "Turbo 5秒" : "標準15秒";
         content = content + " ・ " + mode;
 
         PendingIntent open = PendingIntent.getActivity(this, 11,
