@@ -372,10 +372,13 @@ public final class NsdBrowser {
 
     private boolean canTrackNameLocked(String serviceName) {
         if (serviceName == null || serviceName.isEmpty()) return false;
-        if (queuedNames.contains(serviceName) || serviceCallbacks.containsKey(serviceName)
-                || hasPeerNamedLocked(serviceName)) return true;
+        if (queuedNames.contains(serviceName) || retryTasks.containsKey(serviceName)
+                || serviceCallbacks.containsKey(serviceName) || hasPeerNamedLocked(serviceName)) {
+            return true;
+        }
         Set<String> names = new HashSet<>();
         names.addAll(queuedNames);
+        names.addAll(retryTasks.keySet());
         names.addAll(serviceCallbacks.keySet());
         for (DiscoveredPeer peer : peers.values()) names.add(peer.serviceName);
         return names.size() < MAX_DISCOVERY_RECORDS;
