@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ondokei-audit-${{ github.workflow }}-${{ github.ref }}
+  # A branch push and its PR synchronize event share one group, avoiding duplicate emulator cost.
+  group: ondokei-audit-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 permissions:
