@@ -32,7 +32,7 @@ public final class HistoryStoreConcurrencyTest {
 
     @Before
     public void createIsolatedDatabase() {
-        context = InstrumentationRegistry.getInstrumentation().getContext();
+        context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         context.deleteDatabase(DATABASE);
         store = new HistoryStore(context);
     }

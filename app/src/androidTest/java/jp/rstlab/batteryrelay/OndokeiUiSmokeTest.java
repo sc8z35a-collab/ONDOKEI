@@ -78,7 +78,8 @@ public final class OndokeiUiSmokeTest {
             onView(withText("この端末から共有")).check(matches(isDisplayed()));
             onView(withText("128ビット共有キー")).check(matches(isDisplayed()));
             onView(withText("共有を停止")).perform(click());
-            onView(withText("端末コンディション")).check(matches(isDisplayed()));
+            onView(withText("端末コンディション")).perform(scrollTo())
+                    .check(matches(isDisplayed()));
         }
     }
 }
