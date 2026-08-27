@@ -44,6 +44,7 @@ for permission in \
   android.permission.WAKE_LOCK \
   android.permission.FOREGROUND_SERVICE \
   android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE \
+  android.permission.FOREGROUND_SERVICE_SPECIAL_USE \
   android.permission.POST_NOTIFICATIONS \
   android.permission.ACCESS_LOCAL_NETWORK; do
   grep -Fq "$permission" "$report_dir/permissions.txt"
@@ -54,6 +55,7 @@ grep -Eq ':allowBackup\([^)]*\)=(false|\(type 0x12\)0x0)' \
 grep -Fq 'jp.rstlab.batteryrelay.service.MonitorService' \
   "$report_dir/manifest-tree.txt"
 grep -Fq ':foregroundServiceType(' "$report_dir/manifest-tree.txt"
+grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "$report_dir/manifest-tree.txt"
 
 if grep -Eq 'android.permission.(READ|WRITE)_(CONTACTS|CALL_LOG|SMS)|android.permission.RECORD_AUDIO|android.permission.ACCESS_FINE_LOCATION|android.permission.CAMERA' \
   "$report_dir/permissions.txt"; then
