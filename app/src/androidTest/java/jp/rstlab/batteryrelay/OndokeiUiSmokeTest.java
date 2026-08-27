@@ -57,7 +57,7 @@ public final class OndokeiUiSmokeTest {
                     .check(matches(isDisplayed()));
             onView(withText("バッテリー温度")).perform(scrollTo())
                     .check(matches(isDisplayed()));
-            onView(withText("保存上限は30分。古い測定値は端末内DBから自動で削除され、共有先にも送られません。"))
+            onView(withText("画面と共有は直近30分だけ。端末内DBも最大31点に制限し、時計ずれ保護で一時保持した30分外の値は表示・共有しません。"))
                     .perform(scrollTo()).check(matches(isDisplayed()));
 
             scenario.onActivity(activity -> activity.setRequestedOrientation(
@@ -72,12 +72,13 @@ public final class OndokeiUiSmokeTest {
     }
 
     @Test
-    public void encryptedSharingEntryPointOpensAndCanBeStopped() {
+    public void encryptedSharingEntryPointRequiresExplicitCloseOrStop() {
         try (ActivityScenario<MainActivity> scenario =
                      ActivityScenario.launch(MainActivity.class)) {
             onView(withText("この端末の情報を共有")).perform(scrollTo(), click());
             onView(withText("この端末から共有")).check(matches(isDisplayed()));
             onView(withText("128ビット共有キー")).check(matches(isDisplayed()));
+            onView(withText("共有を継続して閉じる")).check(matches(isDisplayed()));
             onView(withText("共有を停止")).perform(click());
             onView(withText("端末コンディション")).perform(scrollTo())
                     .check(matches(isDisplayed()));
