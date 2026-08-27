@@ -47,11 +47,11 @@ for permission in \
   grep -Fq "$permission" "$report_dir/permissions.txt"
 done
 
-grep -Fq 'android:allowBackup(0x01010280)=(type 0x12)0x0' \
+grep -Eq ':allowBackup\([^)]*\)=(false|\(type 0x12\)0x0)' \
   "$report_dir/manifest-tree.txt"
 grep -Fq 'jp.rstlab.batteryrelay.service.MonitorService' \
   "$report_dir/manifest-tree.txt"
-grep -Fq 'android:foregroundServiceType' "$report_dir/manifest-tree.txt"
+grep -Fq ':foregroundServiceType(' "$report_dir/manifest-tree.txt"
 
 if grep -Eq 'android.permission.(READ|WRITE)_(CONTACTS|CALL_LOG|SMS)|android.permission.RECORD_AUDIO|android.permission.ACCESS_FINE_LOCATION|android.permission.CAMERA' \
   "$report_dir/permissions.txt"; then
