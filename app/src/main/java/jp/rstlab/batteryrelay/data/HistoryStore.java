@@ -119,10 +119,15 @@ public final class HistoryStore extends SQLiteOpenHelper {
     }
 
     private static void pruneInTransaction(SQLiteDatabase db, long nowMillis) {
-        db.delete(TABLE, "captured_at<? OR captured_at>?", new String[]{
-                Long.toString(safeCutoff(nowMillis)), Long.toString(nowMillis)});
+        // Never delete rows merely because the wall clock moved backwards. They are hidden by
+        // readWindow until time catches up, while fresh/current rows are always preferred by cap.
+        db.delete(TABLE, "captured_at<?", new String[]{Long.toString(safeCutoff(nowMillis))});
+        String now = Long.toString(nowMillis);
         db.delete(TABLE, "minute_bucket NOT IN (SELECT minute_bucket FROM " + TABLE
-                + " ORDER BY captured_at DESC LIMIT 31)", null);
+                + " ORDER BY CASE WHEN captured_at<=? THEN 0 ELSE 1 END ASC,"
+                + " CASE WHEN captured_at<=? THEN captured_at END DESC,"
+                + " CASE WHEN captured_at>? THEN captured_at END ASC LIMIT 31)",
+                new String[]{now, now, now});
     }
 
     private static long safeCutoff(long nowMillis) {
