@@ -1,0 +1,116 @@
+name: ONDOKEI full system audit
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ondokei-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-static-audit:
+    name: Build, unit tests, lint and APK audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 36 build tools
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Unit tests, lint and APK/test APK build
+        run: ./gradlew --stacktrace testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+      - name: Verify APK structure, signature, manifest, permissions and SDK levels
+        run: bash scripts/ci/apk-audit.sh app/build/outputs/apk/debug/app-debug.apk artifacts/static-audit
+      - name: Collect reports
+        if: always()
+        run: |
+          mkdir -p artifacts/gradle-reports artifacts/apks
+          cp -R app/build/reports/. artifacts/gradle-reports/ 2>/dev/null || true
+          cp app/build/outputs/apk/debug/app-debug.apk artifacts/apks/ 2>/dev/null || true
+          cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk artifacts/apks/ 2>/dev/null || true
+      - name: Upload build and static audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ondokei-build-static-audit
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  emulator-system-audit:
+    name: Emulator API ${{ matrix.api-level }} system audit
+    needs: build-and-static-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: ${{ fromJSON((github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && '[26,30,34,35,36]' || '[35]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ondokei-build-static-audit
+          path: downloaded
+      - name: Restore executable bits
+        run: chmod +x scripts/ci/*.sh
+      - name: Cache emulator AVD
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: ondokei-avd-${{ matrix.api-level }}-google-apis-x86-64-v1
+      - name: Run instrumentation/UI and hostile lifecycle scenarios
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          disable-animations: true
+          disk-size: 4096M
+          heap-size: 768M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: |
+            mkdir -p artifacts/api-${{ matrix.api-level }}/instrumentation
+            adb install -r -t downloaded/apks/app-debug.apk
+            adb install -r -t downloaded/apks/app-debug-androidTest.apk
+            adb shell pm grant jp.rstlab.batteryrelay.debug android.permission.POST_NOTIFICATIONS || true
+            adb shell am instrument -w -r \
+              -e disableAnalytics true \
+              jp.rstlab.batteryrelay.debug.test/androidx.test.runner.AndroidJUnitRunner \
+              | tee artifacts/api-${{ matrix.api-level }}/instrumentation/instrumentation.txt
+            tr -d '\r' < artifacts/api-${{ matrix.api-level }}/instrumentation/instrumentation.txt \
+              | grep -Eq '^OK \([0-9]+ tests?\)$'
+            scripts/ci/emulator-scenario.sh \
+              downloaded/apks/app-debug.apk artifacts/api-${{ matrix.api-level }}/scenario
+      - name: Collect final logs and screenshot even after failure
+        if: always()
+        run: |
+          mkdir -p artifacts/api-${{ matrix.api-level }}/final
+          adb logcat -d -v threadtime > artifacts/api-${{ matrix.api-level }}/final/logcat.txt 2>&1 || true
+          adb logcat -b crash -d -v threadtime > artifacts/api-${{ matrix.api-level }}/final/logcat-crash.txt 2>&1 || true
+          adb shell dumpsys activity services jp.rstlab.batteryrelay.debug > artifacts/api-${{ matrix.api-level }}/final/services.txt 2>&1 || true
+          adb shell dumpsys meminfo jp.rstlab.batteryrelay.debug > artifacts/api-${{ matrix.api-level }}/final/meminfo.txt 2>&1 || true
+          adb exec-out screencap -p > artifacts/api-${{ matrix.api-level }}/final/final-screen.png 2>/dev/null || true
+      - name: Upload API ${{ matrix.api-level }} audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ondokei-emulator-api-${{ matrix.api-level }}
+          path: artifacts/api-${{ matrix.api-level }}/
+          if-no-files-found: warn
+          retention-days: 14
