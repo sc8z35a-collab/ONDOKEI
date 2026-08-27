@@ -47,6 +47,28 @@ public final class FreshnessAndClockRegressionTest {
     }
 
     @Test
+    public void remoteFreshnessMappingUsesRttMidpointButKeepsReceiptTime() throws Exception {
+        long hostGeneratedAt = 2_000_000_000_000L;
+        long receivedAt = 3_000_000_000_000L;
+        long midpoint = receivedAt - 2_500L;
+        BatterySample stale = sample(hostGeneratedAt - 10_000L, 55, 31.5d);
+        JSONObject payload = new JSONObject()
+                .put("device", "remote")
+                .put("generatedAt", hostGeneratedAt)
+                .put("freshRequested", true)
+                .put("freshApplied", true)
+                .put("requestSequence", 9L)
+                .put("samples", new JSONArray().put(stale.toJson()));
+
+        RemoteSnapshot snapshot = RemoteSnapshot.fromJson(payload, receivedAt, midpoint);
+
+        assertEquals(receivedAt, snapshot.receivedAt);
+        assertEquals(midpoint - 10_000L, snapshot.generatedAt);
+        assertEquals(9L, snapshot.requestSequence);
+        assertTrue(snapshot.freshRequested);
+    }
+
+    @Test
     public void clockRollbackDoesNotPhysicallyDeleteFutureLookingValidRows() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         context.deleteDatabase(DATABASE);
