@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.TextView;
@@ -31,6 +32,12 @@ public final class Ui {
 
     public static int dp(Context context, float value) {
         return Math.round(value * context.getResources().getDisplayMetrics().density);
+    }
+
+    /** Pixel size for custom Canvas text that honors the user's font-scale preference. */
+    public static float sp(Context context, float value) {
+        return TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, value,
+                context.getResources().getDisplayMetrics());
     }
 
     public static TextView text(Context context, String value, float sp, int color, boolean bold) {
@@ -70,6 +77,7 @@ public final class Ui {
         button.setTypeface(Typeface.create("sans", Typeface.BOLD));
         button.setGravity(Gravity.CENTER);
         button.setMinHeight(dp(context, 52));
+        button.setMinWidth(dp(context, 48));
         button.setPadding(dp(context, 14), dp(context, 10), dp(context, 14), dp(context, 10));
         button.setClickable(true);
         button.setFocusable(true);
@@ -87,8 +95,8 @@ public final class Ui {
         chip.setTextSize(12.5f);
         chip.setTypeface(Typeface.create("sans", Typeface.BOLD));
         chip.setGravity(Gravity.CENTER);
-        // Material/Android accessibility guidance: interactive targets are at least 48dp.
         chip.setMinHeight(dp(context, 48));
+        chip.setMinWidth(dp(context, 48));
         chip.setPadding(dp(context, 14), dp(context, 8), dp(context, 14), dp(context, 8));
         chip.setClickable(true);
         chip.setFocusable(true);
