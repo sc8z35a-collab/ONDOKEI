@@ -45,10 +45,17 @@ for permission in \
   android.permission.FOREGROUND_SERVICE \
   android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE \
   android.permission.FOREGROUND_SERVICE_SPECIAL_USE \
-  android.permission.POST_NOTIFICATIONS \
-  android.permission.ACCESS_LOCAL_NETWORK; do
+  android.permission.POST_NOTIFICATIONS; do
   grep -Fq "$permission" "$report_dir/permissions.txt"
 done
+
+# ACCESS_LOCAL_NETWORK is an API 37 dangerous runtime permission. This build targets 36, so the
+# permission must be introduced together with targetSdk 37 runtime UX rather than silently
+# predeclared in the target-36 artifact.
+if grep -Fq 'android.permission.ACCESS_LOCAL_NETWORK' "$report_dir/permissions.txt"; then
+  echo "ACCESS_LOCAL_NETWORK must not be predeclared while targetSdkVersion is 36" >&2
+  exit 1
+fi
 
 grep -Eq ':allowBackup\([^)]*\)=(false|\(type 0x12\)0x0)' \
   "$report_dir/manifest-tree.txt"
