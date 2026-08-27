@@ -9,11 +9,11 @@
 
 ## 結論
 
-第1段監査の指摘を再検証し、さらに時刻異常、プロセス終了、暗号入力境界、NSD悪性入力、複数Network、session競合、rate limit、Foreground Service、WakeLock、OEM API例外、アクセシビリティ、Release経路、CI追跡性まで掘り下げた。
+第1段監査の指摘を再検証し、さらに時刻異常、プロセス終了、暗号入力境界、NSD悪性入力、複数Network、session競合、rate limit、Foreground Service、WakeLock、OEM API例外、アクセシビリティ、Release経路、CI追跡性、Android 17移行境界まで掘り下げた。
 
-以下の45項目を独立した修正対象として扱い、コード修正またはCI/回帰検査を追加した。単なるコードスタイル変更は件数に含めていない。
+以下の46項目を独立した修正対象として扱い、コード修正またはCI/回帰検査を追加した。単なるコードスタイル変更は件数に含めていない。
 
-## 修正台帳 — 45項目
+## 修正台帳 — 46項目
 
 | # | 重大度 | 修正対象 | 対応 |
 |---:|:---:|---|---|
@@ -62,6 +62,7 @@
 | 43 | Medium | ShareHostのaddress rate-limit mapが多数source addressで無制限成長し得る | bucket総数を1024へ制限、IPv6は/64単位化 |
 | 44 | Medium | global fresh gateに負けたsessionまで自身の5秒gateを消費する | global reservation成功後のみsession freshをcommit、race時rollback |
 | 45 | Low | `.local-test/` の古いコンパイル済み `.class` がGit追跡され、ソースと乖離可能 | 追跡済みbytecodeを削除し `.local-test/` をgitignore |
+| 46 | Medium | targetSdk 36のAPKへAPI 37のdangerous `ACCESS_LOCAL_NETWORK` を先行宣言していた | target36 manifestから削除し、CIで不在を検証。target37移行時にruntime UXと同時導入 |
 
 ## 再現・回帰検査
 
@@ -100,6 +101,7 @@
 - ephemeral signing identityによる `assembleRelease`
 - `assembleDebugAndroidTest`
 - Debug/Release APKのZIP、zipalign、signature、Manifest、permission、SDK/package監査
+- targetSdk 36 artifactへ `ACCESS_LOCAL_NETWORK` が先行混入していないことの監査
 - Android Emulator API 35 instrumentation/UI/lifecycle/network-loss/force-stop/crash/ANR監査
 - 検証したexact commit SHAのartifact記録
 
@@ -114,7 +116,7 @@
 - destructive DB upgrade: 修正済み。
 - continuous WakeLock: 60秒protectionでは解放。5/15秒の連続計測中は機能要件上維持する。
 - connectedDevice FGS: API34+はspecialUseへ変更。Play Console側でもspecialUse用途申告が必要。
-- Android 17 local-network: `ACCESS_LOCAL_NETWORK` は先行宣言済み。targetSdk 37へ上げる時点でruntime permission UXを実機検証する。
+- Android 17 local-network: 現在はtargetSdk 36なので `ACCESS_LOCAL_NETWORK` を宣言しない。targetSdk 37へ上げる変更と同じリリースでmanifest宣言・runtime permission UX・拒否/取消し処理・実機検証を追加する。
 
 共有キーの5分rotationは「新規pairingに使えるキーを更新する」動作であり、すでに受理・復号処理へ入った1リクエストを強制中断するrevocation境界とは扱わない。host stop/share generation変更は `lifecycleGeneration` でin-flight処理を拒否する。この挙動は低リスクの仕様境界として明文化し、脆弱性件数には含めない。
 
