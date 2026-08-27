@@ -26,7 +26,8 @@ unzip -t "$apk" | tee "$report_dir/zip-integrity.txt"
 "$apksigner" verify --verbose --print-certs "$apk" | tee "$report_dir/signature.txt"
 "$aapt2" dump badging "$apk" | tee "$report_dir/badging.txt"
 "$aapt2" dump permissions "$apk" | tee "$report_dir/permissions.txt"
-"$aapt2" dump xmltree "$apk" AndroidManifest.xml | tee "$report_dir/manifest-tree.txt"
+"$aapt2" dump xmltree --file AndroidManifest.xml "$apk" \
+  | tee "$report_dir/manifest-tree.txt"
 
 grep -Fq "package: name='$expected_package'" "$report_dir/badging.txt"
 grep -Fq "sdkVersion:'26'" "$report_dir/badging.txt"
