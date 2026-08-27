@@ -50,10 +50,10 @@ public final class TrendChartView extends View {
         linePaint.setStrokeWidth(Ui.dp(getContext(), 2.5f));
         dotPaint.setStyle(Paint.Style.FILL);
         labelPaint.setColor(Ui.subtext(getContext()));
-        labelPaint.setTextSize(Ui.dp(getContext(), 10));
+        labelPaint.setTextSize(Ui.sp(getContext(), 10));
         labelPaint.setTypeface(android.graphics.Typeface.create("sans", android.graphics.Typeface.NORMAL));
         emptyPaint.setColor(Ui.subtext(getContext()));
-        emptyPaint.setTextSize(Ui.dp(getContext(), 13));
+        emptyPaint.setTextSize(Ui.sp(getContext(), 13));
         emptyPaint.setTextAlign(Paint.Align.CENTER);
         setMinimumHeight(Ui.dp(getContext(), 190));
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
@@ -61,7 +61,7 @@ public final class TrendChartView extends View {
 
     public void setData(List<BatterySample> values, TrendMath.Metric metric, int color, long referenceTime) {
         this.samples = values == null ? Collections.emptyList() : new ArrayList<>(values);
-        this.metric = metric;
+        this.metric = metric == null ? TrendMath.Metric.BATTERY_PERCENT : metric;
         this.lineColor = color;
         this.referenceTime = referenceTime > 0 ? referenceTime : System.currentTimeMillis();
         updateDescription();
@@ -85,7 +85,12 @@ public final class TrendChartView extends View {
         }
         canvas.drawLine(left, top, left, bottom, gridPaint);
 
-        long start = referenceTime - TrendMath.WINDOW_MILLIS;
+        long start;
+        try {
+            start = Math.subtractExact(referenceTime, TrendMath.WINDOW_MILLIS);
+        } catch (ArithmeticException overflow) {
+            start = Long.MIN_VALUE;
+        }
         List<Point> points = pointsWithin(start, referenceTime);
         Range range = range(points);
         drawAxisLabels(canvas, plot, range);
@@ -136,7 +141,7 @@ public final class TrendChartView extends View {
     private List<Point> pointsWithin(long start, long end) {
         ArrayList<Point> points = new ArrayList<>();
         for (BatterySample sample : samples) {
-            if (sample.timestampMillis < start || sample.timestampMillis > end) continue;
+            if (sample == null || sample.timestampMillis < start || sample.timestampMillis > end) continue;
             double value = metric == TrendMath.Metric.BATTERY_PERCENT
                     ? sample.levelPercent >= 0 ? sample.levelPercent : Double.NaN
                     : sample.temperatureC;
@@ -164,18 +169,30 @@ public final class TrendChartView extends View {
             min = Math.max(0d, min);
             max = Math.min(100d, max);
         }
-        if (max - min < 0.1d) max = min + 1d;
+        if (max - min < 0.1d) {
+            if (metric == TrendMath.Metric.BATTERY_PERCENT && min >= 100d) min = 99d;
+            else max = min + 1d;
+        }
         return new Range(min, max);
     }
 
     private float xFor(long time, RectF plot, long start) {
-        double fraction = (time - start) / (double) TrendMath.WINDOW_MILLIS;
+        double delta;
+        try {
+            delta = Math.subtractExact(time, start);
+        } catch (ArithmeticException overflow) {
+            delta = time >= start ? TrendMath.WINDOW_MILLIS : 0d;
+        }
+        double fraction = delta / TrendMath.WINDOW_MILLIS;
         fraction = Math.max(0d, Math.min(1d, fraction));
         return (float) (plot.left + plot.width() * fraction);
     }
 
     private static float yFor(double value, RectF plot, Range range) {
-        double fraction = (value - range.min) / (range.max - range.min);
+        double span = range.max - range.min;
+        if (!Double.isFinite(span) || span <= 0d) return plot.centerY();
+        double fraction = (value - range.min) / span;
+        fraction = Math.max(0d, Math.min(1d, fraction));
         return (float) (plot.bottom - plot.height() * fraction);
     }
 
