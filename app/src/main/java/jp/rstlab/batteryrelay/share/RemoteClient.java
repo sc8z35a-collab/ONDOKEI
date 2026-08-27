@@ -44,18 +44,20 @@ public final class RemoteClient {
 
     private static final int MAX_LINE_BYTES = 24 * 1024;
     private static final int MAX_JSON_DEPTH = 8;
+    private static final long RESPONSE_DEADLINE_MILLIS = 12_000L;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Listener listener;
     private final PowerManager powerManager;
     private final ConnectivityManager connectivityManager;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicLong freshRequestGeneration = new AtomicLong(1L);
+    private final AtomicLong freshRequestGeneration = new AtomicLong();
     private final AtomicLong connectionGeneration = new AtomicLong();
     private final Object scheduleLock = new Object();
     private ExecutorService executor;
     private volatile byte[] sessionKey;
     private volatile String activeSessionId;
     private volatile DiscoveredPeer currentPeer;
+    private volatile Socket activeSocket;
     private final AtomicLong nextSequence = new AtomicLong(1L);
     private volatile long fulfilledFreshGeneration;
     private volatile long pollIntervalMillis = SamplingPolicy.NORMAL_INTERVAL_MILLIS;
@@ -80,8 +82,9 @@ public final class RemoteClient {
         }
         // Validate the new request before tearing down an existing authenticated session.
         disconnect();
-        fulfilledFreshGeneration = 0L;
-        freshRequestGeneration.incrementAndGet();
+        // Pairing itself does not imply a user-requested fresh battery measurement. Start with a
+        // normal snapshot; requestRefresh() is the only path that advances the fresh generation.
+        fulfilledFreshGeneration = freshRequestGeneration.get();
         running.set(true);
         long generation = connectionGeneration.incrementAndGet();
         ExecutorService ownedExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -106,6 +109,14 @@ public final class RemoteClient {
         long sequence = nextSequence.getAndIncrement();
         connectionGeneration.incrementAndGet();
         running.set(false);
+
+        // SO_TIMEOUT bounds an individual read, not the lifetime of an in-flight request. Closing
+        // the currently active socket makes disconnect deterministic even if a peer is trickling a
+        // response just below the per-read timeout.
+        Socket inFlight = activeSocket;
+        activeSocket = null;
+        closeQuietly(inFlight);
+
         ExecutorService closing = executor;
         if (closing != null && peer != null && sessionId != null && key != null) {
             try {
@@ -186,9 +197,6 @@ public final class RemoteClient {
                     RemoteSnapshot snapshot = fetch(endpoint, pair.sessionId, pair.key,
                             sequence, forceFresh);
                     if (forceFresh) {
-                        // Only a response that cryptographically echoes this exact sequence and
-                        // fresh flag reaches here, so the user request cannot be consumed by a
-                        // stale/mismatched response.
                         fulfilledFreshGeneration = Math.max(
                                 fulfilledFreshGeneration, requestedFreshGeneration);
                     }
@@ -201,9 +209,6 @@ public final class RemoteClient {
                 } catch (Exception error) {
                     consecutiveFailures++;
                     ErrorDecision decision = classifyPollingError(error);
-                    // Server error envelopes are not authenticated. Require repetition before a
-                    // remote peer can force us to discard an otherwise valid session. Locally
-                    // detected cryptographic/protocol violations are terminal immediately.
                     boolean terminal = decision.terminal
                             && (!(error instanceof ServerException) || consecutiveFailures >= 3);
                     postErrorIfCurrent(generation, decision.message, terminal);
@@ -275,7 +280,7 @@ public final class RemoteClient {
                 throw new IOException("invalid_session_id");
             }
             PairSession result = new PairSession(session, key);
-            key = null; // ownership moved to PairSession
+            key = null;
             return result;
         } finally {
             java.util.Arrays.fill(pairKey, (byte) 0);
@@ -391,15 +396,20 @@ public final class RemoteClient {
 
     private JSONObject send(DiscoveredPeer peer, JSONObject request) throws Exception {
         if (peer == null || request == null) throw new IOException("peer_missing");
-        try (Socket socket = createWifiSocket(peer)) {
-            socket.connect(new InetSocketAddress(peer.host, peer.port), 5_000);
-            socket.setSoTimeout(7_000);
-            socket.setTcpNoDelay(true);
-            OutputStream output = socket.getOutputStream();
+        Socket socket = createWifiSocket(peer);
+        activeSocket = socket;
+        try (Socket owned = socket) {
+            owned.connect(new InetSocketAddress(peer.host, peer.port), 5_000);
+            owned.setSoTimeout(7_000);
+            owned.setTcpNoDelay(true);
+            OutputStream output = owned.getOutputStream();
             output.write(request.toString().getBytes(StandardCharsets.UTF_8));
             output.write('\n');
             output.flush();
-            return parseObjectLimited(readLineLimited(socket.getInputStream()));
+            return parseObjectLimited(readLineLimited(
+                    owned.getInputStream(), RESPONSE_DEADLINE_MILLIS));
+        } finally {
+            if (activeSocket == socket) activeSocket = null;
         }
     }
 
@@ -515,16 +525,28 @@ public final class RemoteClient {
         return "接続できません。同じWi‑Fiと共有キーを確認してください";
     }
 
-    private static String readLineLimited(InputStream input) throws IOException {
+    static String readLineLimited(InputStream input, long deadlineMillis) throws IOException {
+        if (input == null) throw new IOException("missing_input");
+        if (deadlineMillis <= 0L) throw new IOException("response_deadline");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(2048);
+        long started = System.nanoTime();
         int value;
         while ((value = input.read()) != -1) {
+            if (elapsedMillis(started) > deadlineMillis) {
+                throw new IOException("response_deadline");
+            }
             if (value == '\n') break;
             if (value != '\r') bytes.write(value);
             if (bytes.size() > MAX_LINE_BYTES) throw new IOException("message_too_large");
         }
         if (bytes.size() == 0 && value == -1) throw new IOException("empty_response");
         return bytes.toString(StandardCharsets.UTF_8.name());
+    }
+
+    private static long elapsedMillis(long startedNanos) {
+        long elapsed = System.nanoTime() - startedNanos;
+        if (elapsed < 0L) return Long.MAX_VALUE;
+        return elapsed / 1_000_000L;
     }
 
     private static JSONObject parseObjectLimited(String text) throws org.json.JSONException {
@@ -567,7 +589,7 @@ public final class RemoteClient {
 
     private static String safeDeviceName() {
         String model = Build.MODEL == null ? "Android" : Build.MODEL;
-        String clean = model.replaceAll("[\\r\\n\\t]", " ").trim();
+        String clean = model.replaceAll("[\r\n\t]", " ").trim();
         if (clean.isEmpty()) return "Android";
         return clean.codePointCount(0, clean.length()) <= 48 ? clean
                 : clean.substring(0, clean.offsetByCodePoints(0, 48));
@@ -576,6 +598,11 @@ public final class RemoteClient {
     private static String normalizeSecret(String value) {
         return value == null ? "" : value.toUpperCase(java.util.Locale.ROOT)
                 .replaceAll("[^2-9A-Z]", "");
+    }
+
+    private static void closeQuietly(Socket socket) {
+        if (socket == null) return;
+        try { socket.close(); } catch (IOException ignored) {}
     }
 
     private static final class ErrorDecision {
