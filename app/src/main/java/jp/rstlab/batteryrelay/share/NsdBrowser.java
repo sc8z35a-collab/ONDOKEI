@@ -1,5 +1,6 @@
 package jp.rstlab.batteryrelay.share;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
@@ -206,6 +207,9 @@ public final class NsdBrowser {
         }
     }
 
+    // Every caller is guarded by SDK_INT >= 34. Lint models the modular NSD APIs as
+    // extension-only as well, so keep the suppression scoped to this guarded branch.
+    @SuppressLint("NewApi")
     private void trackServiceLocked(NsdServiceInfo service, long runGeneration) {
         String name = service.getServiceName();
         if (!isCurrent(runGeneration) || serviceCallbacks.containsKey(name)) return;
@@ -288,6 +292,7 @@ public final class NsdBrowser {
         }
     }
 
+    @SuppressLint("NewApi")
     private static java.net.InetAddress preferredHost(NsdServiceInfo info) {
         java.net.InetAddress fallback = null;
         for (java.net.InetAddress address : info.getHostAddresses()) {
