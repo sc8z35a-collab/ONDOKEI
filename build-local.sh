@@ -102,7 +102,8 @@ else
   # only affects dev APK updates and can never silently create a fake replacement release key.
   keystore="$project_dir/.dev-signing.jks"
   store_password="${BATTERY_RELAY_DEV_STORE_PASSWORD:-batteryrelay-dev}"
-  key_alias="${BATTERY_RELAY_DEV_KEY_ALIAS:-battery-relay-dev}"
+  # Keep the historical alias so existing .dev-signing.jks files remain usable after upgrading.
+  key_alias="${BATTERY_RELAY_DEV_KEY_ALIAS:-battery-relay}"
   key_password="${BATTERY_RELAY_DEV_KEY_PASSWORD:-$store_password}"
   if [[ ! -f "$keystore" ]]; then
     keytool -genkeypair -noprompt -keystore "$keystore" -storepass "$store_password" \
