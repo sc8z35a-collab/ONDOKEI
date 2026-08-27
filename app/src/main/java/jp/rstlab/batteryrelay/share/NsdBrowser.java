@@ -26,6 +26,7 @@ public final class NsdBrowser {
     private static final int MAX_DISCOVERY_RECORDS = 32;
     private static final int MAX_LOST_TOMBSTONES = 64;
     private static final long LOST_TOMBSTONE_MILLIS = 60_000L;
+    private static final long SERVICE_VALIDATION_TIMEOUT_MILLIS = 5_000L;
 
     public interface Listener {
         void onPeersChanged(List<DiscoveredPeer> peers);
@@ -43,6 +44,7 @@ public final class NsdBrowser {
     private final Map<String, Integer> resolveFailures = new HashMap<>();
     private final Map<String, Runnable> retryTasks = new HashMap<>();
     private final Map<String, NsdManager.ServiceInfoCallback> serviceCallbacks = new HashMap<>();
+    private final Map<String, Runnable> serviceValidationTimeouts = new HashMap<>();
     private WifiManager.MulticastLock multicastLock;
     private boolean running;
     private boolean resolving;
@@ -115,8 +117,6 @@ public final class NsdBrowser {
 
             @Override public void onStopDiscoveryFailed(String serviceType, int errorCode) {
                 synchronized (NsdBrowser.this) {
-                    // Only report a failure that still belongs to the same active run. Explicit
-                    // stop() has already advanced generation, so its late callback is ignored.
                     if (isCurrent(runGeneration)) {
                         postErrorForState(generation, true,
                                 "端末検索の停止に失敗しました (" + errorCode + ")");
@@ -167,9 +167,7 @@ public final class NsdBrowser {
             if (stoppingListener != null && nsdManager != null) {
                 nsdManager.stopServiceDiscovery(stoppingListener);
             }
-        } catch (RuntimeException ignored) {
-            // Listener can already have been stopped by the framework.
-        }
+        } catch (RuntimeException ignored) {}
         clearPendingLocked();
         stopAllServiceTrackingLocked();
         releaseLock();
@@ -249,6 +247,7 @@ public final class NsdBrowser {
             @Override public void onServiceInfoCallbackRegistrationFailed(int errorCode) {
                 synchronized (NsdBrowser.this) {
                     if (!isCurrent(runGeneration)) return;
+                    cancelValidationTimeoutLocked(name);
                     serviceCallbacks.remove(name, this);
                     if (!isLostLocked(name) && canTrackNameLocked(name) && queuedNames.add(name)) {
                         resolveQueue.addLast(service);
@@ -259,6 +258,7 @@ public final class NsdBrowser {
 
             @Override public void onServiceInfoCallbackUnregistered() {
                 synchronized (NsdBrowser.this) {
+                    cancelValidationTimeoutLocked(name);
                     serviceCallbacks.remove(name, this);
                 }
             }
@@ -266,6 +266,7 @@ public final class NsdBrowser {
             @Override public void onServiceLost() {
                 synchronized (NsdBrowser.this) {
                     if (!isCurrent(runGeneration)) return;
+                    cancelValidationTimeoutLocked(name);
                     serviceCallbacks.remove(name, this);
                     markLostLocked(name);
                     cancelRetryLocked(name);
@@ -285,9 +286,12 @@ public final class NsdBrowser {
                                 attrs.get("salt"), attrs.get("pub"), info.getNetwork());
                         peers.entrySet().removeIf(entry -> entry.getValue().serviceName.equals(name));
                         peers.put(peer.stableKey(), peer);
+                        cancelValidationTimeoutLocked(name);
+                        resolveFailures.remove(name);
                         publishLocked(runGeneration);
                     } catch (Exception ignored) {
-                        // Wait for a subsequent complete service update.
+                        // A callback that never produces a valid peer is evicted by the validation
+                        // timeout below, so malformed advertisements cannot pin all 32 slots.
                     }
                 }
             }
@@ -296,8 +300,10 @@ public final class NsdBrowser {
         try {
             nsdManager.registerServiceInfoCallback(service,
                     command -> mainHandler.post(command), callback);
+            scheduleValidationTimeoutLocked(name, callback, runGeneration);
         } catch (RuntimeException error) {
             serviceCallbacks.remove(name, callback);
+            cancelValidationTimeoutLocked(name);
             if (!isLostLocked(name) && canTrackNameLocked(name) && queuedNames.add(name)) {
                 resolveQueue.addLast(service);
                 resolveNextLocked(runGeneration);
@@ -305,8 +311,31 @@ public final class NsdBrowser {
         }
     }
 
+    private void scheduleValidationTimeoutLocked(
+            String name, NsdManager.ServiceInfoCallback callback, long runGeneration) {
+        cancelValidationTimeoutLocked(name);
+        Runnable timeout = () -> {
+            synchronized (NsdBrowser.this) {
+                serviceValidationTimeouts.remove(name);
+                if (!isCurrent(runGeneration) || serviceCallbacks.get(name) != callback
+                        || hasPeerNamedLocked(name)) return;
+                stopTrackingServiceLocked(name);
+                markLostLocked(name);
+            }
+        };
+        serviceValidationTimeouts.put(name, timeout);
+        mainHandler.postDelayed(timeout, SERVICE_VALIDATION_TIMEOUT_MILLIS);
+    }
+
+    private void cancelValidationTimeoutLocked(String name) {
+        if (name == null) return;
+        Runnable timeout = serviceValidationTimeouts.remove(name);
+        if (timeout != null) mainHandler.removeCallbacks(timeout);
+    }
+
     private void stopTrackingServiceLocked(String serviceName) {
         if (serviceName == null) return;
+        cancelValidationTimeoutLocked(serviceName);
         NsdManager.ServiceInfoCallback callback = serviceCallbacks.remove(serviceName);
         if (callback == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return;
         try {
@@ -315,6 +344,10 @@ public final class NsdBrowser {
     }
 
     private void stopAllServiceTrackingLocked() {
+        for (Runnable timeout : serviceValidationTimeouts.values()) {
+            mainHandler.removeCallbacks(timeout);
+        }
+        serviceValidationTimeouts.clear();
         if (serviceCallbacks.isEmpty()) return;
         ArrayList<NsdManager.ServiceInfoCallback> callbacks =
                 new ArrayList<>(serviceCallbacks.values());
