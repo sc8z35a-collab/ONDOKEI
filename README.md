@@ -84,3 +84,15 @@ Android SDK 36、JDK 17、Gradle 8.13 を使用します。生成バイトコー
 > Use case: logo-brand. Asset type: Android adaptive app icon foreground artwork. Create an original, polished icon mark that combines a vertical thermometer with a partially filled smartphone battery, communicating battery level and device temperature monitoring. One unified geometric symbol, not two disconnected icons. Clean premium flat raster illustration, vector-like edges, subtle tactile paper-like depth only if it stays crisp. Perfectly centered square composition, strong silhouette, generous transparent padding, readable at 48 px. Muted terracotta orange, deep charcoal, and a small amount of calm slate blue; restrained natural colors. Genuinely transparent background and clean alpha edges; no text; no letters; no numbers; no gradients; no neon colors; no glow; no mockup; no border frame; no trademark; no watermark; no tiny details.
 
 設計詳細は `docs/ARCHITECTURE.md`、検証結果は `docs/TEST_REPORT.md` を参照してください。
+
+## GitHub Actions 自動システム監査
+
+`.github/workflows/ondokei-system-audit.yml` は、ビルド、JUnit、Lint、APK署名・Manifest・
+permissions・SDK整合性、Android Emulator上の初回起動・権限拒否/許可・Foreground Service・
+画面回転・バックグラウンド復帰・通信断/復帰・低メモリ・プロセス再起動・主要UI機能・
+クラッシュ/ANR検出を自動実行します。通常ブランチはAPI 35だけ、`main` と手動実行は
+API 26/30/34/35/36です。失敗時もAPK、JUnit/Lint結果、logcat、Service/メモリ情報、
+段階別スクリーンショットをArtifactsへ保存します。
+
+検査範囲、Artifacts、実機で残る確認項目、手動フル監査の実行方法は
+`docs/CI_AUDIT.md` を参照してください。
