@@ -32,7 +32,11 @@ unzip -t "$apk" | tee "$report_dir/zip-integrity.txt"
 grep -Fq "package: name='$expected_package'" "$report_dir/badging.txt"
 grep -Fq "minSdkVersion:'26'" "$report_dir/badging.txt"
 grep -Fq "targetSdkVersion:'36'" "$report_dir/badging.txt"
-grep -Fq "launchable-activity: name='jp.rstlab.batteryrelay.MainActivity'" \
+
+# aapt2 may preserve a manifest-relative class name in a standalone aapt2 build while AGP's
+# manifest merger emits the fully-qualified equivalent. Accept only those two canonical forms;
+# do not weaken the check to an arbitrary suffix match.
+grep -Eq "launchable-activity: name='(jp\\.rstlab\\.batteryrelay\\.MainActivity|\\.MainActivity)'" \
   "$report_dir/badging.txt"
 
 for permission in \
@@ -59,7 +63,7 @@ fi
 
 grep -Eq ':allowBackup\([^)]*\)=(false|\(type 0x12\)0x0)' \
   "$report_dir/manifest-tree.txt"
-grep -Fq 'jp.rstlab.batteryrelay.service.MonitorService' \
+grep -Eq 'A: android:name\([^)]*\)="(jp\.rstlab\.batteryrelay\.service\.MonitorService|\.service\.MonitorService)"' \
   "$report_dir/manifest-tree.txt"
 grep -Fq ':foregroundServiceType(' "$report_dir/manifest-tree.txt"
 grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "$report_dir/manifest-tree.txt"
