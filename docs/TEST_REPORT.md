@@ -23,6 +23,7 @@ CIは次を同一SHAに対して実行します。
 - zipalign
 - APK signature検証
 - package / version / minSdk / targetSdk / Manifest / permission / service declaration監査
+- targetSdk 36 artifactへAPI 37の `ACCESS_LOCAL_NETWORK` が先行混入していないことの監査
 - Android Emulator API 35 instrumentation/UI監査
 - notification permission deny/grant
 - Foreground Service / WakeLock状態
@@ -54,7 +55,7 @@ Android 14+では継続ローカル計測を `specialUse` Foreground Serviceと�
 
 ## Android 17 local network
 
-`ACCESS_LOCAL_NETWORK` はtargetSdk 37移行に備えて先行宣言済みです。現在のtargetSdkは36です。targetSdkを37へ上げる際にはruntime permission UXを追加・実機検証する必要があります。
+現在のtargetSdkは36です。API 37で追加されたdangerous permission `ACCESS_LOCAL_NETWORK` は現行APKには先行宣言しません。targetSdkを37へ上げる変更と同じリリースで、Manifest宣言、runtime permission request、拒否/取消し時のUIとnetwork停止処理、物理端末でのNSD/Socket検証を追加します。
 
 ## CIだけでは完全保証できない範囲
 
