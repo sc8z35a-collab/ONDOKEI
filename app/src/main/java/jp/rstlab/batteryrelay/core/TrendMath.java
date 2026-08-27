@@ -35,10 +35,11 @@ public final class TrendMath {
             List<BatterySample> samples, BatterySample live, long nowMillis) {
         if (live == null) return retainWindow(samples, nowMillis);
         ArrayList<BatterySample> merged = new ArrayList<>();
-        long liveBucket = live.timestampMillis / 60_000L;
+        long liveBucket = Math.floorDiv(live.timestampMillis, 60_000L);
         if (samples != null) {
             for (BatterySample sample : samples) {
-                if (sample != null && sample.timestampMillis / 60_000L != liveBucket) {
+                if (sample != null
+                        && Math.floorDiv(sample.timestampMillis, 60_000L) != liveBucket) {
                     merged.add(sample);
                 }
             }
@@ -65,25 +66,28 @@ public final class TrendMath {
         return Collections.unmodifiableList(result);
     }
 
-    /** Returns change per minute from the latest two usable minute samples, or NaN. */
+    /**
+     * Returns change per minute from the newest sample and the newest usable older sample.
+     * If the newest sample cannot provide this metric, NaN is returned rather than surfacing a
+     * stale historical rate next to a current "取得不可" value.
+     */
     public static double ratePerMinute(List<BatterySample> samples, Metric metric) {
         if (samples == null || samples.size() < 2) return Double.NaN;
         BatterySample newest = null;
-        double newestValue = Double.NaN;
         for (BatterySample candidate : samples) {
-            double value = value(candidate, metric);
-            if (Double.isFinite(value) && (newest == null
+            if (candidate != null && (newest == null
                     || candidate.timestampMillis > newest.timestampMillis)) {
                 newest = candidate;
-                newestValue = value;
             }
         }
         if (newest == null) return Double.NaN;
+        double newestValue = value(newest, metric);
+        if (!Double.isFinite(newestValue)) return Double.NaN;
 
         BatterySample bestOlder = null;
         double bestOlderValue = Double.NaN;
         for (BatterySample candidate : samples) {
-            if (candidate == newest) continue;
+            if (candidate == null || candidate == newest) continue;
             long elapsed;
             try {
                 elapsed = Math.subtractExact(newest.timestampMillis, candidate.timestampMillis);
