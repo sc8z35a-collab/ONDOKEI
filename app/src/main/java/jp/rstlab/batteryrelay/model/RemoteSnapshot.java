@@ -45,10 +45,22 @@ public final class RemoteSnapshot {
     }
 
     public static RemoteSnapshot fromJson(JSONObject json, long receivedAt) throws JSONException {
+        return fromJson(json, receivedAt, receivedAt);
+    }
+
+    /**
+     * Parses a host snapshot while mapping host-relative sample ages to a caller-selected local
+     * reference point. RemoteClient uses the request/response RTT midpoint for the mapping while
+     * keeping {@link #receivedAt} as the actual response receipt time.
+     */
+    public static RemoteSnapshot fromJson(JSONObject json, long receivedAt,
+                                          long measurementReferenceAt) throws JSONException {
+        if (json == null) throw new JSONException("snapshot_missing");
         JSONArray array = json.getJSONArray("samples");
         if (array.length() > MAX_REMOTE_SAMPLES) {
             throw new JSONException("too_many_samples");
         }
+        long referenceAt = Math.min(receivedAt, measurementReferenceAt);
         ArrayList<BatterySample> samples = new ArrayList<>(array.length());
         long hostGeneratedAt = json.getLong("generatedAt");
         for (int i = 0; i < array.length(); i++) {
@@ -62,7 +74,7 @@ public final class RemoteSnapshot {
             if (age < 0L || age > TrendMath.WINDOW_MILLIS) continue;
             long mappedTime;
             try {
-                mappedTime = Math.subtractExact(receivedAt, age);
+                mappedTime = Math.subtractExact(referenceAt, age);
             } catch (ArithmeticException overflow) {
                 continue;
             }
