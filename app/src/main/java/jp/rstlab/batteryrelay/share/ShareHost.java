@@ -1,20 +1,20 @@
 package jp.rstlab.batteryrelay.share;
 
 import android.content.Context;
-import android.net.nsd.NsdManager;
-import android.net.nsd.NsdServiceInfo;
-import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
-import android.os.Process;
-import android.os.SystemClock;
-import android.os.PowerManager;
 import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.os.Process;
+import android.os.SystemClock;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -24,32 +24,31 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.MessageDigest;
 import java.security.PublicKey;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 
 import jp.rstlab.batteryrelay.core.CryptoBox;
 import jp.rstlab.batteryrelay.core.TrendMath;
@@ -71,6 +70,7 @@ public final class ShareHost {
     private static final int MAX_ACTIVE_CLIENTS = 8;
     private static final int MAX_REQUESTS_PER_ADDRESS_PER_MINUTE = 120;
     private static final int MAX_SNAPSHOT_REQUESTS_PER_SESSION_PER_MINUTE = 30;
+    private static final int MAX_RATE_LIMIT_BUCKETS = 1024;
     private static final int CLIENT_READ_TIMEOUT_MILLIS = 1_500;
 
     private final Context context;
@@ -110,6 +110,9 @@ public final class ShareHost {
     private long registrationRetryFor = -1L;
 
     public ShareHost(Context context, MeasurementRepository repository) {
+        if (context == null || repository == null) {
+            throw new IllegalArgumentException("context/repository required");
+        }
         this.context = context.getApplicationContext();
         this.repository = repository;
         this.nsdManager = this.context.getSystemService(NsdManager.class);
@@ -135,6 +138,7 @@ public final class ShareHost {
         clientSlots = new Semaphore(MAX_ACTIVE_CLIENTS, true);
         activeAddresses = new ConcurrentHashMap<>();
         requests.clear();
+        attempts.clear();
         lastGlobalFreshElapsed.set(Long.MIN_VALUE);
         registrationFailures = 0;
         registrationRetryFor = -1L;
@@ -146,9 +150,16 @@ public final class ShareHost {
             socket.bind(new InetSocketAddress(boundAddress, 0));
             hostKeyPair = CryptoBox.generateKeyPair();
             pairSalt = CryptoBox.randomBytes(16);
-            shareId = CryptoBox.b64(CryptoBox.randomBytes(12));
-        } catch (IOException | GeneralSecurityException error) {
+            byte[] idBytes = CryptoBox.randomBytes(12);
+            try {
+                shareId = CryptoBox.b64(idBytes);
+            } finally {
+                java.util.Arrays.fill(idBytes, (byte) 0);
+            }
+        } catch (IOException | GeneralSecurityException | RuntimeException error) {
             stop();
+            if (error instanceof IOException) throw (IOException) error;
+            if (error instanceof GeneralSecurityException) throw (GeneralSecurityException) error;
             throw error;
         }
         acceptExecutor = Executors.newSingleThreadExecutor(r -> namedThread(r, "relay-accept"));
@@ -167,12 +178,10 @@ public final class ShareHost {
             acceptExecutor.execute(() -> acceptLoop(generation));
             scheduler.scheduleWithFixedDelay(() -> {
                         if (isCurrent(generation)) rotatePairingCode();
-                    },
-                    5, 5, TimeUnit.MINUTES);
+                    }, 5, 5, TimeUnit.MINUTES);
             scheduler.scheduleWithFixedDelay(() -> {
                         if (isCurrent(generation)) removeExpiredSessions();
-                    },
-                    1, 1, TimeUnit.MINUTES);
+                    }, 1, 1, TimeUnit.MINUTES);
             registerWifiCallback(generation);
             publishState();
         } catch (RuntimeException error) {
@@ -213,31 +222,24 @@ public final class ShareHost {
         if (pairSalt != null) java.util.Arrays.fill(pairSalt, (byte) 0);
         pairSalt = null;
         shareId = null;
+        lastGlobalFreshElapsed.set(Long.MIN_VALUE);
         if (wasRunning) publishState();
     }
 
-    public boolean isRunning() {
-        return running.get();
-    }
-
-    public String getPairingCode() {
-        return pairingCode;
-    }
+    public boolean isRunning() { return running.get(); }
+    public String getPairingCode() { return pairingCode; }
 
     public int getViewerCount() {
         removeExpiredSessions();
         return sessions.size();
     }
 
-    public String getShareId() {
-        return shareId;
-    }
-
-    public void refreshPairingCode() {
-        rotatePairingCode();
-    }
+    public String getShareId() { return shareId; }
+    public void refreshPairingCode() { rotatePairingCode(); }
 
     private synchronized void registerService(int port) {
+        if (!running.get() || port < 1 || port > 65_535 || shareId == null
+                || pairSalt == null || hostKeyPair == null) return;
         unregisterServiceLocked();
         long registration = ++registrationGeneration;
         registrationRetryFor = -1L;
@@ -275,7 +277,6 @@ public final class ShareHost {
             }
 
             @Override public void onServiceUnregistered(NsdServiceInfo serviceInfo) {}
-
             @Override public void onUnregistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {}
         };
         nsdManager.registerService(info, NsdManager.PROTOCOL_DNS_SD, registrationListener);
@@ -318,33 +319,23 @@ public final class ShareHost {
         NsdManager.RegistrationListener registered = registrationListener;
         registrationListener = null;
         if (registered == null || nsdManager == null) return;
-        try {
-            nsdManager.unregisterService(registered);
-        } catch (RuntimeException ignored) {
-            // Registration may already have been removed by the framework.
-        }
+        try { nsdManager.unregisterService(registered); }
+        catch (RuntimeException ignored) {}
     }
 
     private synchronized void registerWifiCallback(long generation) {
         ConnectivityManager manager = context.getSystemService(ConnectivityManager.class);
         if (manager == null || networkCallback != null) return;
         ConnectivityManager.NetworkCallback callback = new ConnectivityManager.NetworkCallback() {
-            @Override public void onAvailable(Network network) {
-                scheduleWifiRebind(generation);
-            }
-
-            @Override public void onLost(Network network) {
-                scheduleWifiRebind(generation);
-            }
-
+            @Override public void onAvailable(Network network) { scheduleWifiRebind(generation); }
+            @Override public void onLost(Network network) { scheduleWifiRebind(generation); }
             @Override public void onLinkPropertiesChanged(Network network, LinkProperties links) {
                 scheduleWifiRebind(generation);
             }
         };
         networkCallback = callback;
         NetworkRequest request = new NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .build();
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build();
         manager.registerNetworkCallback(request, callback);
     }
 
@@ -354,11 +345,8 @@ public final class ShareHost {
         networkCallback = null;
         rebindScheduled.set(false);
         if (manager == null || callback == null) return;
-        try {
-            manager.unregisterNetworkCallback(callback);
-        } catch (RuntimeException ignored) {
-            // Callback may already have been unregistered by the framework.
-        }
+        try { manager.unregisterNetworkCallback(callback); }
+        catch (RuntimeException ignored) {}
     }
 
     private void scheduleWifiRebind(long generation) {
@@ -370,9 +358,11 @@ public final class ShareHost {
         }
         try {
             timer.schedule(() -> {
-                if (!isCurrent(generation)) return;
-                rebindScheduled.set(false);
-                rebindToCurrentWifi(generation);
+                try {
+                    if (isCurrent(generation)) rebindToCurrentWifi(generation);
+                } finally {
+                    rebindScheduled.set(false);
+                }
             }, 750L, TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException ignored) {
             rebindScheduled.set(false);
@@ -520,15 +510,14 @@ public final class ShareHost {
                             .put("ok", false).put("error", code).toString());
                 } catch (Exception ignored) {}
             }
-        } catch (IOException ignored) {
-            // Peer disconnected before a response could be sent.
-        }
+        } catch (IOException ignored) {}
     }
 
     private JSONObject handlePair(JSONObject request, String address, long generation) throws Exception {
         if (!isCurrent(generation)) throw new ProtocolException("host_stopped");
         if (!consumeAttempt(address)) throw new ProtocolException("rate_limited");
         byte[] pairKey = null;
+        byte[] plaintext = null;
         try {
             String sid = request.getString("sid");
             if (!sid.equals(shareId)) throw new ProtocolException("stale_share");
@@ -538,16 +527,15 @@ public final class ShareHost {
             if (pairReplays.containsKey(replayToken)) {
                 throw new ProtocolException("replayed_pair_request");
             }
-            PublicKey clientPublic = CryptoBox.decodePublicKey(CryptoBox.unb64(request.getString("clientPub")));
+            PublicKey clientPublic = CryptoBox.decodePublicKey(
+                    CryptoBox.unb64(request.getString("clientPub")));
             pairKey = CryptoBox.derivePairKey(hostKeyPair.getPrivate(), clientPublic,
                     pairSalt, pairingCode, shareId);
-            byte[] plaintext = CryptoBox.decrypt(pairKey,
+            plaintext = CryptoBox.decrypt(pairKey,
                     CryptoBox.unb64(request.getString("nonce")),
                     CryptoBox.unb64(request.getString("box")),
                     CryptoBox.aad("pair-request", shareId));
             JSONObject hello = parseObjectLimited(new String(plaintext, StandardCharsets.UTF_8));
-            // Parsing the timestamp catches malformed payloads. Replay protection is based on
-            // the authenticated request token, so pairing does not depend on synchronized clocks.
             hello.getLong("ts");
             synchronized (replayLock) {
                 if (!isCurrent(generation)) throw new ProtocolException("host_stopped");
@@ -561,7 +549,10 @@ public final class ShareHost {
                 pairReplays.put(replayToken, now);
             }
 
-            String sessionId = CryptoBox.b64(CryptoBox.randomBytes(12));
+            String sessionId;
+            byte[] idBytes = CryptoBox.randomBytes(12);
+            try { sessionId = CryptoBox.b64(idBytes); }
+            finally { java.util.Arrays.fill(idBytes, (byte) 0); }
             byte[] sessionKey = CryptoBox.randomBytes(CryptoBox.AES_KEY_BYTES);
             try {
                 synchronized (sessionLock) {
@@ -584,12 +575,10 @@ public final class ShareHost {
                         .put("nonce", CryptoBox.b64(nonce))
                         .put("box", CryptoBox.b64(box));
             } finally {
-                // ViewerSession owns a clone; do not leave the transport copy for GC.
                 java.util.Arrays.fill(sessionKey, (byte) 0);
             }
-        } catch (Exception error) {
-            throw error;
         } finally {
+            if (plaintext != null) java.util.Arrays.fill(plaintext, (byte) 0);
             if (pairKey != null) java.util.Arrays.fill(pairKey, (byte) 0);
         }
     }
@@ -601,46 +590,47 @@ public final class ShareHost {
         ViewerSession session = sessions.get(sessionId);
         long now = SystemClock.elapsedRealtime();
         if (session == null || session.isExpired(now) || !session.isSequenceFresh(seq)) {
-            if (session != null && session.isExpired(now)) {
-                sessions.remove(sessionId);
+            if (session != null && session.isExpired(now)
+                    && sessions.remove(sessionId, session)) {
                 session.destroy();
                 publishState();
             }
             throw new ProtocolException("invalid_session");
         }
         String requestAadId = sessionId + "/" + seq;
-        byte[] plaintext = CryptoBox.decrypt(session.key,
-                CryptoBox.unb64(request.getString("nonce")),
-                CryptoBox.unb64(request.getString("box")),
-                CryptoBox.aad("snapshot-request", requestAadId));
-        JSONObject inner = parseObjectLimited(new String(plaintext, StandardCharsets.UTF_8));
-        if (inner.getLong("seq") != seq) {
-            throw new ProtocolException("invalid_request");
-        }
-        if (!session.acceptSequence(seq, now, true)) {
-            throw new ProtocolException("session_rate_limited");
-        }
-
-        boolean freshRequested = inner.optBoolean("fresh", false);
-        boolean freshApplied = false;
-        if (freshRequested && allowFreshSample(session, now)) {
-            try {
-                repository.sampleNowIfOlderThan(MIN_FRESH_INTERVAL_MILLIS);
-                freshApplied = true;
-            } catch (RuntimeException ignored) {
-                // A forced refresh should still return the last valid snapshot on OEM API failure.
+        byte[] plaintext = null;
+        try {
+            plaintext = CryptoBox.decrypt(session.key,
+                    CryptoBox.unb64(request.getString("nonce")),
+                    CryptoBox.unb64(request.getString("box")),
+                    CryptoBox.aad("snapshot-request", requestAadId));
+            JSONObject inner = parseObjectLimited(new String(plaintext, StandardCharsets.UTF_8));
+            if (inner.getLong("seq") != seq) throw new ProtocolException("invalid_request");
+            if (!session.acceptSequence(seq, now, true)) {
+                throw new ProtocolException("session_rate_limited");
             }
-        }
 
-        JSONObject payload = snapshotJson(System.currentTimeMillis(), freshRequested,
-                freshApplied, seq);
-        byte[] nonce = CryptoBox.randomBytes(CryptoBox.GCM_NONCE_BYTES);
-        byte[] box = CryptoBox.encrypt(session.key, nonce,
-                payload.toString().getBytes(StandardCharsets.UTF_8),
-                CryptoBox.aad("snapshot-response", requestAadId));
-        return new JSONObject().put("ok", true)
-                .put("nonce", CryptoBox.b64(nonce))
-                .put("box", CryptoBox.b64(box));
+            boolean freshRequested = inner.optBoolean("fresh", false);
+            boolean freshApplied = false;
+            if (freshRequested && allowFreshSample(session, now)) {
+                try {
+                    repository.sampleNowIfOlderThan(MIN_FRESH_INTERVAL_MILLIS);
+                    freshApplied = true;
+                } catch (RuntimeException ignored) {}
+            }
+
+            JSONObject payload = snapshotJson(System.currentTimeMillis(), freshRequested,
+                    freshApplied, seq);
+            byte[] nonce = CryptoBox.randomBytes(CryptoBox.GCM_NONCE_BYTES);
+            byte[] box = CryptoBox.encrypt(session.key, nonce,
+                    payload.toString().getBytes(StandardCharsets.UTF_8),
+                    CryptoBox.aad("snapshot-response", requestAadId));
+            return new JSONObject().put("ok", true)
+                    .put("nonce", CryptoBox.b64(nonce))
+                    .put("box", CryptoBox.b64(box));
+        } finally {
+            if (plaintext != null) java.util.Arrays.fill(plaintext, (byte) 0);
+        }
     }
 
     private JSONObject handleLogout(JSONObject request, long generation) throws Exception {
@@ -650,16 +640,26 @@ public final class ShareHost {
         ViewerSession session = sessions.get(sessionId);
         long now = SystemClock.elapsedRealtime();
         if (session == null || session.isExpired(now) || !session.isSequenceFresh(seq)) {
+            if (session != null && session.isExpired(now)
+                    && sessions.remove(sessionId, session)) {
+                session.destroy();
+                publishState();
+            }
             throw new ProtocolException("invalid_session");
         }
         String aadId = sessionId + "/" + seq;
-        byte[] plaintext = CryptoBox.decrypt(session.key,
-                CryptoBox.unb64(request.getString("nonce")),
-                CryptoBox.unb64(request.getString("box")),
-                CryptoBox.aad("logout-request", aadId));
-        JSONObject inner = parseObjectLimited(new String(plaintext, StandardCharsets.UTF_8));
-        if (inner.getLong("seq") != seq || !session.acceptSequence(seq, now, false)) {
-            throw new ProtocolException("invalid_logout");
+        byte[] plaintext = null;
+        try {
+            plaintext = CryptoBox.decrypt(session.key,
+                    CryptoBox.unb64(request.getString("nonce")),
+                    CryptoBox.unb64(request.getString("box")),
+                    CryptoBox.aad("logout-request", aadId));
+            JSONObject inner = parseObjectLimited(new String(plaintext, StandardCharsets.UTF_8));
+            if (inner.getLong("seq") != seq || !session.acceptSequence(seq, now, false)) {
+                throw new ProtocolException("invalid_logout");
+            }
+        } finally {
+            if (plaintext != null) java.util.Arrays.fill(plaintext, (byte) 0);
         }
         if (sessions.remove(sessionId, session)) session.destroy();
         publishState();
@@ -669,22 +669,27 @@ public final class ShareHost {
     private boolean allowFreshSample(ViewerSession session, long nowElapsed) {
         try {
             if (powerManager != null && powerManager.isPowerSaveMode()) return false;
-        } catch (RuntimeException ignored) {
-            // Treat an OEM PowerManager failure as unknown; thermal limits still apply below.
-        }
+        } catch (RuntimeException ignored) {}
         BatterySample latest = repository.latest();
         if (latest != null && latest.thermalStatus >= 3) return false;
-        if (!session.tryFresh(nowElapsed, MIN_FRESH_INTERVAL_MILLIS)) return false;
+        if (!session.canFresh(nowElapsed, MIN_FRESH_INTERVAL_MILLIS)) return false;
+
         while (true) {
             long prior = lastGlobalFreshElapsed.get();
-            if (prior != Long.MIN_VALUE && nowElapsed - prior < MIN_FRESH_INTERVAL_MILLIS) return false;
-            if (lastGlobalFreshElapsed.compareAndSet(prior, nowElapsed)) return true;
+            if (prior != Long.MIN_VALUE && nowElapsed >= prior
+                    && nowElapsed - prior < MIN_FRESH_INTERVAL_MILLIS) return false;
+            if (lastGlobalFreshElapsed.compareAndSet(prior, nowElapsed)) {
+                if (session.commitFresh(nowElapsed, MIN_FRESH_INTERVAL_MILLIS)) return true;
+                // Another request for this same session won the race after canFresh(). Give the
+                // global reservation back if nobody else has advanced it.
+                lastGlobalFreshElapsed.compareAndSet(nowElapsed, prior);
+                return false;
+            }
         }
     }
 
     private JSONObject snapshotJson(long now, boolean freshRequested, boolean freshApplied,
-                                    long requestSequence)
-            throws JSONException {
+                                    long requestSequence) throws JSONException {
         List<BatterySample> samples = TrendMath.retainWindow(repository.snapshot(), now);
         JSONArray array = new JSONArray();
         for (BatterySample sample : samples) array.put(sample.toJson());
@@ -718,37 +723,48 @@ public final class ShareHost {
     }
 
     private boolean removeExpiredSessionsLocked(long now) {
-        return sessions.entrySet().removeIf(entry -> {
-            if (!entry.getValue().isExpired(now)) return false;
-            entry.getValue().destroy();
-            return true;
+        AtomicBoolean removed = new AtomicBoolean(false);
+        sessions.forEach((id, session) -> {
+            if (session.isExpired(now) && sessions.remove(id, session)) {
+                session.destroy();
+                removed.set(true);
+            }
         });
+        return removed.get();
     }
 
     private boolean consumeAttempt(String address) {
-        AttemptCounter counter = attempts.computeIfAbsent(address, ignored -> new AttemptCounter());
-        return counter.consume(SystemClock.elapsedRealtime(), 5);
+        return consumeBounded(attempts, address, 5);
     }
 
     private boolean consumeRequest(String address) {
-        AttemptCounter counter = requests.computeIfAbsent(address, ignored -> new AttemptCounter());
-        return counter.consume(SystemClock.elapsedRealtime(), MAX_REQUESTS_PER_ADDRESS_PER_MINUTE);
+        return consumeBounded(requests, address, MAX_REQUESTS_PER_ADDRESS_PER_MINUTE);
+    }
+
+    private static boolean consumeBounded(Map<String, AttemptCounter> counters,
+                                          String address, int limit) {
+        String key = address == null ? "unknown" : address;
+        AttemptCounter existing = counters.get(key);
+        if (existing != null) return existing.consume(SystemClock.elapsedRealtime(), limit);
+        if (counters.size() >= MAX_RATE_LIMIT_BUCKETS) return false;
+        AttemptCounter created = new AttemptCounter();
+        AttemptCounter winner = counters.putIfAbsent(key, created);
+        return (winner == null ? created : winner).consume(SystemClock.elapsedRealtime(), limit);
     }
 
     private static boolean acquireAddress(Map<String, AtomicInteger> counters, String address) {
-        AtomicInteger counter = counters.computeIfAbsent(address,
-                ignored -> new AtomicInteger());
+        String key = address == null ? "unknown" : address;
+        AtomicInteger counter = counters.computeIfAbsent(key, ignored -> new AtomicInteger());
         int active = counter.incrementAndGet();
         if (active <= 1) return true;
-        if (counter.decrementAndGet() == 0) counters.remove(address, counter);
+        if (counter.decrementAndGet() == 0) counters.remove(key, counter);
         return false;
     }
 
     private static void releaseAddress(Map<String, AtomicInteger> counters, String address) {
-        AtomicInteger counter = counters.get(address);
-        if (counter != null && counter.decrementAndGet() <= 0) {
-            counters.remove(address, counter);
-        }
+        String key = address == null ? "unknown" : address;
+        AtomicInteger counter = counters.get(key);
+        if (counter != null && counter.decrementAndGet() <= 0) counters.remove(key, counter);
     }
 
     private static String pairReplayToken(JSONObject request) throws Exception {
@@ -756,11 +772,14 @@ public final class ShareHost {
         digest.update(request.getString("clientPub").getBytes(StandardCharsets.UTF_8));
         digest.update((byte) 0);
         digest.update(request.getString("nonce").getBytes(StandardCharsets.UTF_8));
-        return CryptoBox.b64(digest.digest());
+        byte[] token = digest.digest();
+        try { return CryptoBox.b64(token); }
+        finally { java.util.Arrays.fill(token, (byte) 0); }
     }
 
     private void trimPairReplays(long now) {
-        pairReplays.entrySet().removeIf(entry -> now - entry.getValue() > 6L * 60L * 1000L);
+        pairReplays.entrySet().removeIf(entry -> now >= entry.getValue()
+                && now - entry.getValue() > 6L * 60L * 1000L);
     }
 
     private void publishState() {
@@ -792,17 +811,21 @@ public final class ShareHost {
         String prefix = "Battery Relay - ";
         String source = safeDeviceName();
         StringBuilder clipped = new StringBuilder();
+        int bytesUsed = 0;
         for (int offset = 0; offset < source.length();) {
             int codePoint = source.codePointAt(offset);
-            String next = clipped.toString() + new String(Character.toChars(codePoint));
-            if (next.getBytes(StandardCharsets.UTF_8).length > 44) break;
-            clipped.appendCodePoint(codePoint);
+            String chars = new String(Character.toChars(codePoint));
+            int bytes = chars.getBytes(StandardCharsets.UTF_8).length;
+            if (bytesUsed + bytes > 44) break;
+            clipped.append(chars);
+            bytesUsed += bytes;
             offset += Character.charCount(codePoint);
         }
         return prefix + (clipped.length() == 0 ? "Android" : clipped);
     }
 
     private static String readLineLimited(InputStream input) throws IOException {
+        if (input == null) throw new IOException("missing_input");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(1024);
         int value;
         while ((value = input.read()) != -1) {
@@ -815,6 +838,7 @@ public final class ShareHost {
     }
 
     private static JSONObject parseObjectLimited(String text) throws JSONException {
+        if (text == null) throw new JSONException("missing_json");
         requireJsonDepth(text);
         return new JSONObject(text);
     }
@@ -842,6 +866,7 @@ public final class ShareHost {
     }
 
     private static void writeLine(OutputStream output, String line) throws IOException {
+        if (output == null || line == null) throw new IOException("missing_output");
         output.write(line.getBytes(StandardCharsets.UTF_8));
         output.write('\n');
         output.flush();
@@ -878,17 +903,19 @@ public final class ShareHost {
         if (links == null) throw new IOException("Wi‑Fiに接続してください");
         InetAddress fallback = null;
         for (LinkAddress link : links.getLinkAddresses()) {
+            if (link == null) continue;
             InetAddress address = link.getAddress();
-            if (address.isLoopbackAddress() || address.isAnyLocalAddress()) continue;
+            if (address == null || address.isLoopbackAddress() || address.isAnyLocalAddress()
+                    || address.isMulticastAddress()) continue;
             if (address instanceof java.net.Inet4Address) return new WifiBinding(wifi, address);
-            fallback = address;
+            if (fallback == null) fallback = address;
         }
         if (fallback == null) throw new IOException("Wi‑Fiアドレスを取得できません");
         return new WifiBinding(wifi, fallback);
     }
 
     private static boolean isWifi(ConnectivityManager manager, Network network) {
-        if (network == null) return false;
+        if (manager == null || network == null) return false;
         NetworkCapabilities capabilities = manager.getNetworkCapabilities(network);
         return capabilities != null
                 && capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
@@ -898,7 +925,6 @@ public final class ShareHost {
         if (address == null) return "unknown";
         byte[] raw = address.getAddress();
         if (raw.length != 16) return address.getHostAddress();
-        // IPv6 privacy addresses in one /64 must not create unbounded limiter entries.
         StringBuilder prefix = new StringBuilder("v6:");
         for (int i = 0; i < 8; i++) {
             prefix.append(Character.forDigit((raw[i] >>> 4) & 0xf, 16));
@@ -910,7 +936,6 @@ public final class ShareHost {
     private static final class WifiBinding {
         final Network network;
         final InetAddress address;
-
         WifiBinding(Network network, InetAddress address) {
             this.network = network;
             this.address = address;
@@ -931,6 +956,7 @@ public final class ShareHost {
     }
 
     private static String safeMessage(Throwable error) {
+        if (error == null) return "unknown";
         String text = error.getMessage();
         return text == null || text.trim().isEmpty() ? error.getClass().getSimpleName() : text;
     }
@@ -946,6 +972,7 @@ public final class ShareHost {
         private volatile boolean confirmed;
 
         ViewerSession(byte[] key, long now) {
+            if (key == null) throw new IllegalArgumentException("session key required");
             this.key = key.clone();
             this.createdElapsed = now;
             this.lastSeen = now;
@@ -958,13 +985,12 @@ public final class ShareHost {
         synchronized boolean acceptSequence(long sequence, long now, boolean countForRateLimit) {
             if (sequence <= highestSequence || sequence < 1) return false;
             if (countForRateLimit) {
-                if (requestWindowStart == 0L || now - requestWindowStart >= 60_000L) {
+                if (requestWindowStart == 0L || now < requestWindowStart
+                        || now - requestWindowStart >= 60_000L) {
                     requestWindowStart = now;
                     requestsInWindow = 0;
                 }
-                if (requestsInWindow >= MAX_SNAPSHOT_REQUESTS_PER_SESSION_PER_MINUTE) {
-                    return false;
-                }
+                if (requestsInWindow >= MAX_SNAPSHOT_REQUESTS_PER_SESSION_PER_MINUTE) return false;
                 requestsInWindow++;
             }
             highestSequence = sequence;
@@ -974,21 +1000,23 @@ public final class ShareHost {
         }
 
         boolean isExpired(long now) {
-            return !confirmed && now - createdElapsed > UNCONFIRMED_SESSION_MILLIS
+            if (now < createdElapsed || now < lastSeen) return false;
+            return (!confirmed && now - createdElapsed > UNCONFIRMED_SESSION_MILLIS)
                     || now - lastSeen > SESSION_IDLE_MILLIS;
         }
 
-        synchronized boolean tryFresh(long now, long minimumInterval) {
-            if (lastFreshElapsed != Long.MIN_VALUE && now - lastFreshElapsed < minimumInterval) {
-                return false;
-            }
+        synchronized boolean canFresh(long now, long minimumInterval) {
+            return lastFreshElapsed == Long.MIN_VALUE || now < lastFreshElapsed
+                    || now - lastFreshElapsed >= minimumInterval;
+        }
+
+        synchronized boolean commitFresh(long now, long minimumInterval) {
+            if (!canFresh(now, minimumInterval)) return false;
             lastFreshElapsed = now;
             return true;
         }
 
-        void destroy() {
-            java.util.Arrays.fill(key, (byte) 0);
-        }
+        void destroy() { java.util.Arrays.fill(key, (byte) 0); }
     }
 
     private static final class AttemptCounter {
@@ -1005,11 +1033,12 @@ public final class ShareHost {
         }
 
         synchronized boolean isStale(long now) {
-            return lastAttempt != 0L && now - lastAttempt > 10L * 60L * 1000L;
+            return lastAttempt != 0L && now >= lastAttempt
+                    && now - lastAttempt > 10L * 60L * 1000L;
         }
 
         private void resetIfNeeded(long now) {
-            if (windowStart == 0L || now - windowStart >= 60_000L) {
+            if (windowStart == 0L || now < windowStart || now - windowStart >= 60_000L) {
                 windowStart = now;
                 attempts = 0;
             }
