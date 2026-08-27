@@ -49,12 +49,12 @@ public final class RemoteDeviceManager {
     private NsdBrowser recoveryBrowser;
     private final Runnable stopRecovery = () -> {
         synchronized (RemoteDeviceManager.this) {
-            if (recoveryBrowser != null) recoveryBrowser.stop();
-            recoveryBrowser = null;
+            stopRecoveryLocked();
         }
     };
 
     public RemoteDeviceManager(Context context) {
+        if (context == null) throw new IllegalArgumentException("context required");
         this.context = context.getApplicationContext();
     }
 
@@ -64,6 +64,10 @@ public final class RemoteDeviceManager {
     }
 
     public synchronized void connect(DiscoveredPeer peer, String code, boolean turboMode) {
+        if (peer == null) {
+            postMessageLocked("", "接続先が見つかりません。端末を再検索してください", true);
+            return;
+        }
         String key = peer.stableKey();
         Connection existing = connections.get(key);
         turbo = turboMode;
@@ -82,7 +86,6 @@ public final class RemoteDeviceManager {
         }
 
         activeKey = key;
-
         Connection connection = new Connection(key, peer.serviceName, peer);
         RemoteClient client = new RemoteClient(context, new RemoteClient.Listener() {
             @Override public void onPairingSucceeded(String deviceName) {
@@ -96,6 +99,7 @@ public final class RemoteDeviceManager {
             }
 
             @Override public void onSnapshot(RemoteSnapshot snapshot) {
+                if (snapshot == null) return;
                 synchronized (RemoteDeviceManager.this) {
                     Connection current = connections.get(key);
                     if (current == null || current.client != connection.client) return;
@@ -112,10 +116,13 @@ public final class RemoteDeviceManager {
                     if (current == null || current.client != connection.client) return;
                     current.connected = false;
                     if (terminal) {
-                        connections.remove(key);
+                        connections.remove(key, current);
                         if (key.equals(activeKey)) activeKey = null;
                         current.client.disconnect();
-                    } else startRecoveryDiscoveryLocked();
+                    } else {
+                        startRecoveryDiscoveryLocked();
+                    }
+                    updateIntervalsLocked();
                     publishLocked();
                     postMessageLocked(key, message, terminal);
                 }
@@ -150,34 +157,44 @@ public final class RemoteDeviceManager {
     }
 
     public synchronized void refresh(String key) {
+        if (key == null) return;
         Connection connection = connections.get(key);
         if (connection != null) connection.client.requestRefresh();
     }
 
     /** Refreshes mutable NSD endpoints without dropping an authenticated session. */
     public synchronized void updateDiscoveredPeers(List<DiscoveredPeer> peers) {
-        if (peers == null) return;
+        if (peers == null || peers.isEmpty()) return;
+        boolean updated = false;
         for (DiscoveredPeer peer : peers) {
+            if (peer == null) continue;
             Connection connection = connections.get(peer.stableKey());
             if (connection != null) {
                 connection.peer = peer;
                 connection.client.updatePeer(peer);
+                updated = true;
             }
         }
+        if (updated && recoveryBrowser != null) stopRecoveryLocked();
     }
 
     public synchronized void disconnect(String key) {
+        if (key == null) return;
         Connection connection = connections.remove(key);
         if (connection == null) return;
         connection.client.disconnect();
         if (key.equals(activeKey)) activeKey = null;
+        updateIntervalsLocked();
         publishLocked();
     }
 
     /** Explicit global stop; ordinary tab switches intentionally never call this. */
     public synchronized void disconnectAll() {
-        stopRecovery.run();
-        if (connections.isEmpty()) return;
+        stopRecoveryLocked();
+        if (connections.isEmpty()) {
+            activeKey = null;
+            return;
+        }
         ArrayList<Connection> closing = new ArrayList<>(connections.values());
         connections.clear();
         activeKey = null;
@@ -186,10 +203,11 @@ public final class RemoteDeviceManager {
     }
 
     public synchronized boolean contains(String key) {
-        return connections.containsKey(key);
+        return key != null && connections.containsKey(key);
     }
 
     public synchronized Device get(String key) {
+        if (key == null) return null;
         Connection connection = connections.get(key);
         return connection == null ? null : connection.copy();
     }
@@ -211,19 +229,31 @@ public final class RemoteDeviceManager {
     }
 
     private void startRecoveryDiscoveryLocked() {
-        if (recoveryBrowser != null) return;
-        recoveryBrowser = new NsdBrowser(context, new NsdBrowser.Listener() {
+        if (recoveryBrowser != null || connections.isEmpty()) return;
+        NsdBrowser browser = new NsdBrowser(context, new NsdBrowser.Listener() {
             @Override public void onPeersChanged(List<DiscoveredPeer> peers) {
                 updateDiscoveredPeers(peers);
             }
 
             @Override public void onDiscoveryError(String message) {
-                // The regular retry loop continues; discovery will be attempted on a later failure.
+                synchronized (RemoteDeviceManager.this) {
+                    // Allow the next transport failure to retry discovery immediately rather than
+                    // being blocked by a dead browser until the 15-second timer fires.
+                    if (recoveryBrowser != null) stopRecoveryLocked();
+                }
             }
         });
-        recoveryBrowser.start();
+        recoveryBrowser = browser;
+        browser.start();
         mainHandler.removeCallbacks(stopRecovery);
         mainHandler.postDelayed(stopRecovery, 15_000L);
+    }
+
+    private void stopRecoveryLocked() {
+        mainHandler.removeCallbacks(stopRecovery);
+        NsdBrowser browser = recoveryBrowser;
+        recoveryBrowser = null;
+        if (browser != null) browser.stop();
     }
 
     private void publishLocked() {
@@ -241,11 +271,13 @@ public final class RemoteDeviceManager {
     private void postMessageLocked(String key, String message, boolean terminal) {
         Listener target = listener;
         if (target == null) return;
+        String safeKey = key == null ? "" : key;
+        String safeMessage = message == null ? "接続状態が変化しました" : message;
         mainHandler.post(() -> {
             synchronized (RemoteDeviceManager.this) {
                 if (listener != target) return;
             }
-            target.onDeviceMessage(key, message, terminal);
+            target.onDeviceMessage(safeKey, safeMessage, terminal);
         });
     }
 
