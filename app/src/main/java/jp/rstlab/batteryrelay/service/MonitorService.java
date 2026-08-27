@@ -34,6 +34,8 @@ public final class MonitorService extends Service {
     public static final String EXTRA_TURBO = "turbo";
     private static final String CHANNEL_ID = "battery_monitor";
     private static final int NOTIFICATION_ID = 3011;
+    private static final long WAKE_LOCK_TIMEOUT_MILLIS = 10L * 60L * 1000L;
+    private static final long WAKE_LOCK_RENEW_MILLIS = 5L * 60L * 1000L;
 
     private HandlerThread workerThread;
     private Handler worker;
@@ -47,6 +49,14 @@ public final class MonitorService extends Service {
     private volatile int lastThermalStatus = -1;
     private long lastNotificationAt;
     private volatile long samplingGeneration;
+
+    private final Runnable wakeLockRenewal = new Runnable() {
+        @Override public void run() {
+            if (!sampling) return;
+            renewSamplingWakeLock();
+            if (sampling && worker != null) worker.postDelayed(this, WAKE_LOCK_RENEW_MILLIS);
+        }
+    };
 
     private final Runnable sampleTask = new Runnable() {
         @Override public void run() {
@@ -160,16 +170,28 @@ public final class MonitorService extends Service {
     }
 
     private void acquireSamplingWakeLock() {
+        if (worker != null) worker.removeCallbacks(wakeLockRenewal);
+        renewSamplingWakeLock();
+        if (sampling && worker != null) {
+            worker.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEW_MILLIS);
+        }
+    }
+
+    private void renewSamplingWakeLock() {
         PowerManager.WakeLock lock = samplingWakeLock;
         if (lock == null) return;
         try {
-            if (!lock.isHeld()) lock.acquire();
+            // Refresh the framework timeout before it can expire. The tiny release/acquire window
+            // is on the already-awake sampler thread and prevents an unbounded lock on bad paths.
+            if (lock.isHeld()) lock.release();
+            if (sampling) lock.acquire(WAKE_LOCK_TIMEOUT_MILLIS);
         } catch (RuntimeException ignored) {
             // Sampling can still proceed while awake even on an OEM that rejects the lock.
         }
     }
 
     private void releaseSamplingWakeLock() {
+        if (worker != null) worker.removeCallbacks(wakeLockRenewal);
         PowerManager.WakeLock lock = samplingWakeLock;
         if (lock == null) return;
         try {
