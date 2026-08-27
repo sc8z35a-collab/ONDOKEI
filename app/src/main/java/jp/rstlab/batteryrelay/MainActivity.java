@@ -132,8 +132,6 @@ public final class MainActivity extends android.app.Activity {
                             }
                         }
                     } else {
-                        // Pairing/recovery can change connected state before the first snapshot.
-                        // Re-render so the pill never claims a disconnected peer is connected.
                         render();
                     }
                 }
@@ -405,7 +403,7 @@ public final class MainActivity extends android.app.Activity {
 
     private static String compactDeviceName(String value) {
         String name = value == null ? "共有端末" : value
-                .replaceFirst("(?i)^Battery Relay\s*-\s*", "").trim();
+                .replaceFirst("(?i)^Battery Relay *- *", "").trim();
         int count = name.codePointCount(0, name.length());
         if (count <= 18) return name;
         int end = name.offsetByCodePoints(0, 17);
@@ -717,8 +715,6 @@ public final class MainActivity extends android.app.Activity {
             thermalValue.setText(thermalLabel(latest.thermalStatus));
         }
 
-        // Remote sample timestamps are mapped to this device's wall clock. Anchoring the chart to
-        // actual current time makes stale/disconnected data move left instead of staying at "今".
         long chartTime = System.currentTimeMillis();
         batteryChart.setData(displayedSamples, TrendMath.Metric.BATTERY_PERCENT,
                 Ui.terracotta(this), chartTime);
@@ -769,8 +765,6 @@ public final class MainActivity extends android.app.Activity {
 
     private void showHostDialog() {
         Dialog dialog = baseDialog();
-        // Sharing persists after the dialog is closed. Do not let an outside tap/back gesture hide
-        // that fact; the user must explicitly choose "continue sharing" or "stop sharing".
         dialog.setCanceledOnTouchOutside(false);
         dialog.setCancelable(false);
         LinearLayout content = dialogContent();
