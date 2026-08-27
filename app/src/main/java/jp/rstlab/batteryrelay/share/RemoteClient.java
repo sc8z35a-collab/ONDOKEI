@@ -48,7 +48,7 @@ public final class RemoteClient {
     private final PowerManager powerManager;
     private final ConnectivityManager connectivityManager;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicBoolean forceFreshNext = new AtomicBoolean(true);
+    private final AtomicLong freshRequestGeneration = new AtomicLong(1L);
     private final AtomicLong connectionGeneration = new AtomicLong();
     private final Object scheduleLock = new Object();
     private ExecutorService executor;
@@ -56,6 +56,7 @@ public final class RemoteClient {
     private volatile String activeSessionId;
     private volatile DiscoveredPeer currentPeer;
     private final AtomicLong nextSequence = new AtomicLong(1L);
+    private volatile long fulfilledFreshGeneration;
     private volatile long pollIntervalMillis = SamplingPolicy.NORMAL_INTERVAL_MILLIS;
 
     public RemoteClient(Context context, Listener listener) {
@@ -72,7 +73,8 @@ public final class RemoteClient {
             postError("26文字の共有キーを入力してください", true);
             return;
         }
-        forceFreshNext.set(true);
+        fulfilledFreshGeneration = 0L;
+        freshRequestGeneration.incrementAndGet();
         running.set(true);
         long generation = connectionGeneration.incrementAndGet();
         ExecutorService ownedExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -137,10 +139,10 @@ public final class RemoteClient {
         }
     }
 
-    /** Wakes the polling loop and asks the host to capture a new sample before replying. */
+    /** Wakes the polling loop and keeps the request pending until a fresh-request response arrives. */
     public void requestRefresh() {
         if (!running.get()) return;
-        forceFreshNext.set(true);
+        freshRequestGeneration.incrementAndGet();
         synchronized (scheduleLock) {
             scheduleLock.notifyAll();
         }
@@ -165,12 +167,19 @@ public final class RemoteClient {
             int consecutiveFailures = 0;
             while (running.get() && connectionGeneration.get() == generation
                     && !Thread.currentThread().isInterrupted()) {
+                long requestedFreshGeneration = freshRequestGeneration.get();
+                boolean forceFresh = requestedFreshGeneration > fulfilledFreshGeneration;
                 try {
-                    boolean forceFresh = forceFreshNext.getAndSet(false);
                     DiscoveredPeer endpoint = currentPeer;
                     if (endpoint == null) throw new IOException("peer_missing");
                     RemoteSnapshot snapshot = fetch(endpoint, pair.sessionId, pair.key,
                             nextSequence.getAndIncrement(), forceFresh);
+                    if (forceFresh) {
+                        // Only the exact fresh requests covered by this successful response are
+                        // consumed. A request arriving during the network call remains pending.
+                        fulfilledFreshGeneration = Math.max(
+                                fulfilledFreshGeneration, requestedFreshGeneration);
+                    }
                     consecutiveFailures = 0;
                     postIfCurrent(generation, () -> listener.onSnapshot(snapshot));
                     waitForNextPoll();
@@ -179,19 +188,19 @@ public final class RemoteClient {
                     break;
                 } catch (Exception error) {
                     consecutiveFailures++;
-                    if (error instanceof ServerException
-                            && "invalid_session".equals(((ServerException) error).code)
-                            && consecutiveFailures >= 3) {
-                        postErrorIfCurrent(generation,
-                                "共有セッションの期限が切れました。再度共有キーで接続してください", true);
-                        break;
-                    }
-                    // Plain transport errors are not authenticated; never let one erase a key.
-                    postErrorIfCurrent(generation,
-                            "Wi‑Fiを再確認しています…（接続情報は保持）", false);
+                    ErrorDecision decision = classifyPollingError(error);
+                    // Server error envelopes are not authenticated. Require repetition before a
+                    // remote peer can force us to discard an otherwise valid session.
+                    boolean terminal = decision.terminal
+                            && (!(error instanceof ServerException) || consecutiveFailures >= 3);
+                    postErrorIfCurrent(generation, decision.message, terminal);
+                    if (terminal) break;
                     try {
-                        waitForDelay(Math.min(60_000L,
-                                2_000L << Math.min(5, consecutiveFailures - 1)));
+                        waitForDelay(decision.retryDelayMillis > 0L
+                                ? decision.retryDelayMillis
+                                : Math.min(60_000L,
+                                2_000L << Math.min(5, consecutiveFailures - 1)),
+                                requestedFreshGeneration);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         break;
@@ -200,8 +209,7 @@ public final class RemoteClient {
             }
         } catch (Exception error) {
             if (connectionGeneration.get() == generation) {
-                postErrorIfCurrent(generation,
-                        "接続できません。共有キーと同じWi‑Fiを確認してください", true);
+                postErrorIfCurrent(generation, pairingErrorMessage(error), true);
             }
         } finally {
             if (activeKey != null) java.util.Arrays.fill(activeKey, (byte) 0);
@@ -292,13 +300,9 @@ public final class RemoteClient {
     private void waitForNextPoll() throws InterruptedException {
         long anchor = SystemClock.elapsedRealtime();
         synchronized (scheduleLock) {
-            while (running.get() && !forceFreshNext.get()) {
+            while (running.get() && !hasPendingFreshRequest()) {
                 long interval = pollIntervalMillis;
-                if (powerManager != null && (powerManager.isPowerSaveMode()
-                        || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                        && safeThermalStatus() >= 3))) {
-                    interval = SamplingPolicy.BACKGROUND_INTERVAL_MILLIS;
-                }
+                if (isProtectionActive()) interval = SamplingPolicy.BACKGROUND_INTERVAL_MILLIS;
                 long remaining = anchor + interval - SystemClock.elapsedRealtime();
                 if (remaining <= 0L) break;
                 scheduleLock.wait(remaining);
@@ -306,15 +310,32 @@ public final class RemoteClient {
         }
     }
 
-    private void waitForDelay(long delayMillis) throws InterruptedException {
+    /**
+     * Backs off the failed request even when that same fresh request remains pending. A newly
+     * requested refresh (generation greater than the failed request) can still wake the delay.
+     */
+    private void waitForDelay(long delayMillis, long failedFreshGeneration)
+            throws InterruptedException {
         synchronized (scheduleLock) {
             long deadline = SystemClock.elapsedRealtime() + delayMillis;
-            while (running.get() && !forceFreshNext.get()) {
+            while (running.get()) {
+                if (freshRequestGeneration.get() > failedFreshGeneration) break;
                 long remaining = deadline - SystemClock.elapsedRealtime();
                 if (remaining <= 0L) break;
                 scheduleLock.wait(remaining);
             }
         }
+    }
+
+    private boolean hasPendingFreshRequest() {
+        return freshRequestGeneration.get() > fulfilledFreshGeneration;
+    }
+
+    private boolean isProtectionActive() {
+        try {
+            if (powerManager != null && powerManager.isPowerSaveMode()) return true;
+        } catch (RuntimeException ignored) {}
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && safeThermalStatus() >= 3;
     }
 
     private void sendLogout(DiscoveredPeer peer, String sessionId, byte[] key, long sequence)
@@ -381,6 +402,59 @@ public final class RemoteClient {
         }
     }
 
+    private static ErrorDecision classifyPollingError(Exception error) {
+        if (error instanceof SecurityException) {
+            return new ErrorDecision(
+                    "ローカルネットワーク権限がありません。Androidの権限設定を確認してください",
+                    true, 0L);
+        }
+        if (!(error instanceof ServerException)) {
+            return new ErrorDecision("Wi‑Fiを再確認しています…（接続情報は保持）", false, 0L);
+        }
+        String code = ((ServerException) error).code;
+        if ("invalid_session".equals(code)) {
+            return new ErrorDecision(
+                    "共有セッションの期限が切れました。再度共有キーで接続してください",
+                    true, 0L);
+        }
+        if ("unsupported_version".equals(code) || "unsupported_operation".equals(code)) {
+            return new ErrorDecision("共有元とアプリの通信バージョンが一致しません", true, 0L);
+        }
+        if ("host_stopped".equals(code) || "stale_share".equals(code)) {
+            return new ErrorDecision("共有元で共有が停止または更新されました。再接続してください",
+                    true, 0L);
+        }
+        if ("session_rate_limited".equals(code) || "rate_limited".equals(code)) {
+            return new ErrorDecision("共有元の更新頻度制限中です。少し待って再試行します",
+                    false, 5_000L);
+        }
+        if ("viewer_limit".equals(code)) {
+            return new ErrorDecision("共有元の接続上限に達しています", true, 0L);
+        }
+        return new ErrorDecision("共有元で一時的な処理エラーが発生しました。再試行します",
+                false, 0L);
+    }
+
+    private static String pairingErrorMessage(Exception error) {
+        if (error instanceof SecurityException) {
+            return "ローカルネットワーク権限がありません。Androidの権限設定を確認してください";
+        }
+        if (error instanceof ServerException) {
+            String code = ((ServerException) error).code;
+            if ("stale_share".equals(code)) return "共有情報が更新されました。端末を再検索してください";
+            if ("viewer_limit".equals(code)) return "共有元の接続上限に達しています";
+            if ("rate_limited".equals(code)) return "接続試行が多すぎます。少し待って再試行してください";
+            if ("unsupported_version".equals(code)) return "共有元とアプリの通信バージョンが一致しません";
+            if ("replayed_pair_request".equals(code) || "replay_table_full".equals(code)) {
+                return "共有元の保護機能により接続が拒否されました。共有を開き直してください";
+            }
+            if ("request_failed".equals(code) || "pair_rejected".equals(code)) {
+                return "接続できません。共有キーが正しいか確認してください";
+            }
+        }
+        return "接続できません。同じWi‑Fiと共有キーを確認してください";
+    }
+
     private static String readLineLimited(InputStream input) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(2048);
         int value;
@@ -441,6 +515,18 @@ public final class RemoteClient {
     private static String normalizeSecret(String value) {
         return value == null ? "" : value.toUpperCase(java.util.Locale.ROOT)
                 .replaceAll("[^2-9A-Z]", "");
+    }
+
+    private static final class ErrorDecision {
+        final String message;
+        final boolean terminal;
+        final long retryDelayMillis;
+
+        ErrorDecision(String message, boolean terminal, long retryDelayMillis) {
+            this.message = message;
+            this.terminal = terminal;
+            this.retryDelayMillis = retryDelayMillis;
+        }
     }
 
     private static final class ServerException extends IOException {

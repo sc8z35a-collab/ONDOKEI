@@ -12,6 +12,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.CopyOnWriteArraySet;
 
@@ -39,17 +40,32 @@ public final class MeasurementRepository {
         store = new HistoryStore(context);
     }
 
+    /** Loads/prunes persisted state away from the Android main thread. */
+    public void initializeAsync(Executor executor) {
+        if (executor == null) return;
+        executor.execute(this::initialize);
+    }
+
     public synchronized void initialize() {
+        long now = System.currentTimeMillis();
         try {
-            cached = store.readWindow(System.currentTimeMillis());
-            if (!cached.isEmpty()) {
-                lastPersistedMinute = Math.floorDiv(
-                        cached.get(cached.size() - 1).timestampMillis, 60_000L);
+            List<BatterySample> loaded = store.readWindow(now);
+            if (liveSample != null) {
+                cached = jp.rstlab.batteryrelay.core.TrendMath.upsertMinuteSample(
+                        loaded, liveSample, now);
+                lastPersistedMinute = Math.floorDiv(liveSample.timestampMillis, 60_000L);
+            } else {
+                cached = loaded;
+                if (!cached.isEmpty()) {
+                    lastPersistedMinute = Math.floorDiv(
+                            cached.get(cached.size() - 1).timestampMillis, 60_000L);
+                }
             }
         } catch (RuntimeException databaseFailure) {
-            // Live monitoring and encrypted sharing must remain usable if storage is full/corrupt.
-            cached = Collections.emptyList();
+            // Never overwrite live in-memory data because storage is temporarily unavailable.
+            cached = jp.rstlab.batteryrelay.core.TrendMath.retainWindow(cached, now);
         }
+        notifyListeners(cached);
     }
 
     public synchronized BatterySample sampleNow() {
@@ -126,9 +142,12 @@ public final class MeasurementRepository {
     }
 
     public void addListener(Listener listener) {
+        if (listener == null) return;
         listeners.add(listener);
         List<BatterySample> copy = cached;
-        mainHandler.post(() -> listener.onMeasurementsChanged(copy));
+        mainHandler.post(() -> {
+            if (listeners.contains(listener)) listener.onMeasurementsChanged(copy);
+        });
     }
 
     public void removeListener(Listener listener) {

@@ -13,7 +13,10 @@ import jp.rstlab.batteryrelay.core.TrendMath;
 public final class RemoteSnapshot {
     private static final int MAX_REMOTE_SAMPLES = 31;
     public final String deviceName;
+    /** Timestamp of the newest mapped measurement, not merely the TCP response time. */
     public final long generatedAt;
+    /** Local wall time when this encrypted response was received. */
+    public final long receivedAt;
     public final List<BatterySample> samples;
     public final boolean freshRequested;
     public final boolean freshApplied;
@@ -21,8 +24,16 @@ public final class RemoteSnapshot {
 
     public RemoteSnapshot(String deviceName, long generatedAt, List<BatterySample> samples,
                           boolean freshRequested, boolean freshApplied, long requestSequence) {
+        this(deviceName, generatedAt, samples, freshRequested, freshApplied, requestSequence,
+                generatedAt);
+    }
+
+    public RemoteSnapshot(String deviceName, long generatedAt, List<BatterySample> samples,
+                          boolean freshRequested, boolean freshApplied, long requestSequence,
+                          long receivedAt) {
         this.deviceName = deviceName;
         this.generatedAt = generatedAt;
+        this.receivedAt = receivedAt;
         this.samples = Collections.unmodifiableList(new ArrayList<>(samples));
         this.freshRequested = freshRequested;
         this.freshApplied = freshApplied;
@@ -60,15 +71,17 @@ public final class RemoteSnapshot {
                     raw.thermalStatus));
         }
         List<BatterySample> retained = TrendMath.coalesceMinuteSamples(samples, receivedAt);
+        long latestMeasurementAt = retained.isEmpty()
+                ? 0L : retained.get(retained.size() - 1).timestampMillis;
         String device = json.optString("device", "共有端末")
                 .replaceAll("[\\r\\n\\t]", " ").trim();
         if (device.isEmpty()) device = "共有端末";
         if (device.codePointCount(0, device.length()) > 48) {
             device = device.substring(0, device.offsetByCodePoints(0, 48));
         }
-        return new RemoteSnapshot(device, receivedAt, retained,
+        return new RemoteSnapshot(device, latestMeasurementAt, retained,
                 json.optBoolean("freshRequested", false),
-                json.optBoolean("freshApplied", false), requirePositiveSequence(json));
+                json.optBoolean("freshApplied", false), requirePositiveSequence(json), receivedAt);
     }
 
     private static long requirePositiveSequence(JSONObject json) throws JSONException {
