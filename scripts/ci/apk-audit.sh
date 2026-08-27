@@ -63,7 +63,9 @@ fi
 
 grep -Eq ':allowBackup\([^)]*\)=(false|\(type 0x12\)0x0)' \
   "$report_dir/manifest-tree.txt"
-grep -Eq 'A: android:name\([^)]*\)="(jp\.rstlab\.batteryrelay\.service\.MonitorService|\.service\.MonitorService)"' \
+# aapt2 prefixes the attribute with the Android namespace URL. Match the exact component value
+# while allowing only the fully-qualified or manifest-relative canonical service name.
+grep -Eq 'android:name\([^)]*\)="(jp\.rstlab\.batteryrelay\.service\.MonitorService|\.service\.MonitorService)"' \
   "$report_dir/manifest-tree.txt"
 grep -Fq ':foregroundServiceType(' "$report_dir/manifest-tree.txt"
 grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "$report_dir/manifest-tree.txt"
