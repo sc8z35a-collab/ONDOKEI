@@ -5,9 +5,9 @@ import android.content.Context;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.Build;
 import android.os.SystemClock;
 
 import java.util.ArrayDeque;
@@ -50,6 +50,7 @@ public final class NsdBrowser {
     private NsdManager.DiscoveryListener discoveryListener;
 
     public NsdBrowser(Context context, Listener listener) {
+        if (context == null || listener == null) throw new IllegalArgumentException("context/listener required");
         Context app = context.getApplicationContext();
         this.nsdManager = app.getSystemService(NsdManager.class);
         this.wifiManager = app.getSystemService(WifiManager.class);
@@ -58,75 +59,79 @@ public final class NsdBrowser {
 
     private NsdManager.DiscoveryListener createDiscoveryListener(long runGeneration) {
         return new NsdManager.DiscoveryListener() {
-        @Override public void onDiscoveryStarted(String serviceType) {}
+            @Override public void onDiscoveryStarted(String serviceType) {}
 
-        @Override public void onServiceFound(NsdServiceInfo serviceInfo) {
-            synchronized (NsdBrowser.this) {
-                if (!isCurrent(runGeneration) || !isOurType(serviceInfo.getServiceType())) return;
-                String name = serviceInfo.getServiceName();
-                pruneLostLocked();
-                lostNames.remove(name);
-                cancelRetryLocked(name);
-                if (!canTrackNameLocked(name)) return;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    trackServiceLocked(serviceInfo, runGeneration);
-                    return;
+            @Override public void onServiceFound(NsdServiceInfo serviceInfo) {
+                if (serviceInfo == null) return;
+                synchronized (NsdBrowser.this) {
+                    if (!isCurrent(runGeneration) || !isOurType(serviceInfo.getServiceType())) return;
+                    String name = validServiceName(serviceInfo.getServiceName());
+                    if (name == null) return;
+                    pruneLostLocked();
+                    lostNames.remove(name);
+                    cancelRetryLocked(name);
+                    if (!canTrackNameLocked(name)) return;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        trackServiceLocked(serviceInfo, runGeneration);
+                        return;
+                    }
+                    if (queuedNames.add(name)) {
+                        resolveQueue.add(serviceInfo);
+                        resolveNextLocked(runGeneration);
+                    }
                 }
-                if (queuedNames.add(name)) {
-                    resolveQueue.add(serviceInfo);
-                    resolveNextLocked(runGeneration);
+            }
+
+            @Override public void onServiceLost(NsdServiceInfo serviceInfo) {
+                if (serviceInfo == null) return;
+                synchronized (NsdBrowser.this) {
+                    if (!isCurrent(runGeneration)) return;
+                    String name = validServiceName(serviceInfo.getServiceName());
+                    if (name == null) return;
+                    markLostLocked(name);
+                    cancelRetryLocked(name);
+                    stopTrackingServiceLocked(name);
+                    resolveQueue.removeIf(info -> name.equals(info.getServiceName()));
+                    queuedNames.remove(name);
+                    resolveFailures.remove(name);
+                    peers.entrySet().removeIf(entry -> entry.getValue().serviceName.equals(name));
+                    publishLocked(runGeneration);
                 }
             }
-        }
 
-        @Override public void onServiceLost(NsdServiceInfo serviceInfo) {
-            synchronized (NsdBrowser.this) {
-                if (!isCurrent(runGeneration)) return;
-                String name = serviceInfo.getServiceName();
-                markLostLocked(name);
-                cancelRetryLocked(name);
-                stopTrackingServiceLocked(name);
-                resolveQueue.removeIf(info -> info.getServiceName().equals(name));
-                queuedNames.remove(name);
-                resolveFailures.remove(name);
-                peers.entrySet().removeIf(entry -> entry.getValue().serviceName.equals(name));
-                publishLocked(runGeneration);
+            @Override public void onDiscoveryStopped(String serviceType) {
+                synchronized (NsdBrowser.this) {
+                    if (!isCurrent(runGeneration)) return;
+                    terminateRunLocked("端末検索が中断されました。画面を開き直して再試行してください");
+                }
             }
-        }
 
-        @Override public void onDiscoveryStopped(String serviceType) {
-            synchronized (NsdBrowser.this) {
-                // An explicit stop advances the generation first. Reaching this branch therefore
-                // means Android stopped discovery unexpectedly and the UI must not stay spinning.
-                if (!isCurrent(runGeneration)) return;
-                running = false;
-                generation++;
-                discoveryListener = null;
-                clearPendingLocked();
-                stopAllServiceTrackingLocked();
-                releaseLock();
-                fail("端末検索が中断されました。画面を開き直して再試行してください");
+            @Override public void onStartDiscoveryFailed(String serviceType, int errorCode) {
+                synchronized (NsdBrowser.this) {
+                    if (!isCurrent(runGeneration)) return;
+                    terminateRunLocked("端末検索を開始できませんでした (" + errorCode + ")");
+                }
             }
-        }
 
-        @Override public void onStartDiscoveryFailed(String serviceType, int errorCode) {
-            if (!isCurrentThreadSafe(runGeneration)) return;
-            fail("端末検索を開始できませんでした (" + errorCode + ")");
-            stop();
-        }
-
-        @Override public void onStopDiscoveryFailed(String serviceType, int errorCode) {
-            if (isCurrentThreadSafe(runGeneration)) {
-                fail("端末検索の停止に失敗しました (" + errorCode + ")");
+            @Override public void onStopDiscoveryFailed(String serviceType, int errorCode) {
+                synchronized (NsdBrowser.this) {
+                    // Only report a failure that still belongs to the same active run. Explicit
+                    // stop() has already advanced generation, so its late callback is ignored.
+                    if (isCurrent(runGeneration)) {
+                        postErrorForState(generation, true,
+                                "端末検索の停止に失敗しました (" + errorCode + ")");
+                    }
+                }
             }
-        }
         };
     }
 
     public synchronized void start() {
         if (running) return;
         if (nsdManager == null) {
-            fail("この端末はネットワーク探索に対応していません");
+            long failedGeneration = ++generation;
+            postErrorForState(failedGeneration, false,
+                    "この端末はネットワーク探索に対応していません");
             return;
         }
         running = true;
@@ -143,18 +148,15 @@ public final class NsdBrowser {
             }
             nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, runListener);
         } catch (RuntimeException error) {
-            running = false;
-            generation++;
-            discoveryListener = null;
-            clearPendingLocked();
-            releaseLock();
-            fail("端末検索を開始できません: " + safeMessage(error));
+            terminateRunLocked("端末検索を開始できません: " + safeMessage(error));
         }
     }
 
     public synchronized void stop() {
         if (!running) {
             clearPendingLocked();
+            stopAllServiceTrackingLocked();
+            releaseLock();
             return;
         }
         running = false;
@@ -162,7 +164,9 @@ public final class NsdBrowser {
         NsdManager.DiscoveryListener stoppingListener = discoveryListener;
         discoveryListener = null;
         try {
-            if (stoppingListener != null) nsdManager.stopServiceDiscovery(stoppingListener);
+            if (stoppingListener != null && nsdManager != null) {
+                nsdManager.stopServiceDiscovery(stoppingListener);
+            }
         } catch (RuntimeException ignored) {
             // Listener can already have been stopped by the framework.
         }
@@ -171,10 +175,24 @@ public final class NsdBrowser {
         releaseLock();
     }
 
+    private void terminateRunLocked(String message) {
+        running = false;
+        long terminalGeneration = ++generation;
+        discoveryListener = null;
+        clearPendingLocked();
+        stopAllServiceTrackingLocked();
+        releaseLock();
+        postErrorForState(terminalGeneration, false, message);
+    }
+
     private void resolveNextLocked(long runGeneration) {
         if (!isCurrent(runGeneration) || resolving || resolveQueue.isEmpty()) return;
         NsdServiceInfo service = resolveQueue.removeFirst();
-        String name = service.getServiceName();
+        String name = validServiceName(service.getServiceName());
+        if (name == null) {
+            resolveNextLocked(runGeneration);
+            return;
+        }
         if (isLostLocked(name)) {
             queuedNames.remove(name);
             resolveNextLocked(runGeneration);
@@ -184,31 +202,36 @@ public final class NsdBrowser {
         try {
             nsdManager.resolveService(service, new NsdManager.ResolveListener() {
                 @Override public void onResolveFailed(NsdServiceInfo info, int errorCode) {
-                    scheduleResolveRetry(info, runGeneration);
+                    scheduleResolveRetry(info != null ? info : service, runGeneration);
                 }
 
                 @Override public void onServiceResolved(NsdServiceInfo info) {
                     synchronized (NsdBrowser.this) {
                         if (!isCurrent(runGeneration)) return;
+                        String resolvedName = info == null ? null : validServiceName(info.getServiceName());
+                        if (resolvedName == null) {
+                            finishResolveLocked(name, runGeneration);
+                            return;
+                        }
                         try {
-                            if (isLostLocked(info.getServiceName())) {
-                                finishResolveLocked(info.getServiceName(), runGeneration);
+                            if (isLostLocked(resolvedName)) {
+                                finishResolveLocked(resolvedName, runGeneration);
                                 return;
                             }
                             Map<String, byte[]> attrs = info.getAttributes();
                             DiscoveredPeer peer = DiscoveredPeer.fromTxt(
-                                    info.getServiceName(), info.getHost(), info.getPort(),
+                                    resolvedName, info.getHost(), info.getPort(),
                                     attrs.get("sid"), attrs.get("salt"), attrs.get("pub"));
                             peers.entrySet().removeIf(entry -> entry.getValue().serviceName
                                     .equals(peer.serviceName));
                             peers.put(peer.stableKey(), peer);
-                            resolveFailures.remove(info.getServiceName());
-                            cancelRetryLocked(info.getServiceName());
+                            resolveFailures.remove(resolvedName);
+                            cancelRetryLocked(resolvedName);
                             publishLocked(runGeneration);
                         } catch (Exception ignored) {
                             // Ignore unrelated or malformed mDNS records.
                         }
-                        finishResolveLocked(info.getServiceName(), runGeneration);
+                        finishResolveLocked(resolvedName, runGeneration);
                     }
                 }
             });
@@ -217,19 +240,16 @@ public final class NsdBrowser {
         }
     }
 
-    // Every caller is guarded by SDK_INT >= 34. Lint models the modular NSD APIs as
-    // extension-only as well, so keep the suppression scoped to this guarded branch.
     @SuppressLint("NewApi")
     private void trackServiceLocked(NsdServiceInfo service, long runGeneration) {
-        String name = service.getServiceName();
-        if (!isCurrent(runGeneration) || serviceCallbacks.containsKey(name)
+        String name = validServiceName(service == null ? null : service.getServiceName());
+        if (name == null || !isCurrent(runGeneration) || serviceCallbacks.containsKey(name)
                 || !canTrackNameLocked(name)) return;
         NsdManager.ServiceInfoCallback callback = new NsdManager.ServiceInfoCallback() {
             @Override public void onServiceInfoCallbackRegistrationFailed(int errorCode) {
                 synchronized (NsdBrowser.this) {
                     if (!isCurrent(runGeneration)) return;
                     serviceCallbacks.remove(name, this);
-                    // A few OEM implementations fail the modern tracker intermittently.
                     if (!isLostLocked(name) && canTrackNameLocked(name) && queuedNames.add(name)) {
                         resolveQueue.addLast(service);
                         resolveNextLocked(runGeneration);
@@ -257,7 +277,7 @@ public final class NsdBrowser {
 
             @Override public void onServiceUpdated(NsdServiceInfo info) {
                 synchronized (NsdBrowser.this) {
-                    if (!isCurrent(runGeneration) || isLostLocked(name)) return;
+                    if (!isCurrent(runGeneration) || isLostLocked(name) || info == null) return;
                     try {
                         Map<String, byte[]> attrs = info.getAttributes();
                         DiscoveredPeer peer = DiscoveredPeer.fromTxt(name,
@@ -286,6 +306,7 @@ public final class NsdBrowser {
     }
 
     private void stopTrackingServiceLocked(String serviceName) {
+        if (serviceName == null) return;
         NsdManager.ServiceInfoCallback callback = serviceCallbacks.remove(serviceName);
         if (callback == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return;
         try {
@@ -308,13 +329,15 @@ public final class NsdBrowser {
 
     @SuppressLint("NewApi")
     private static java.net.InetAddress preferredHost(NsdServiceInfo info) {
+        if (info == null) return null;
         java.net.InetAddress fallback = null;
         for (java.net.InetAddress address : info.getHostAddresses()) {
-            if (address == null || address.isAnyLocalAddress() || address.isLoopbackAddress()) continue;
+            if (!isUsableHost(address)) continue;
             if (address instanceof java.net.Inet4Address) return address;
             if (fallback == null) fallback = address;
         }
-        return fallback != null ? fallback : info.getHost();
+        java.net.InetAddress legacy = info.getHost();
+        return fallback != null ? fallback : isUsableHost(legacy) ? legacy : null;
     }
 
     private synchronized void scheduleResolveRetry(NsdServiceInfo info, long runGeneration) {
@@ -322,8 +345,13 @@ public final class NsdBrowser {
     }
 
     private void scheduleResolveRetryLocked(NsdServiceInfo info, long runGeneration) {
-        if (!isCurrent(runGeneration)) return;
-        String name = info.getServiceName();
+        if (!isCurrent(runGeneration) || info == null) return;
+        String name = validServiceName(info.getServiceName());
+        if (name == null) {
+            resolving = false;
+            resolveNextLocked(runGeneration);
+            return;
+        }
         int count = Math.min(6, resolveFailures.getOrDefault(name, 0) + 1);
         resolveFailures.put(name, count);
         finishResolveLocked(name, runGeneration);
@@ -346,7 +374,7 @@ public final class NsdBrowser {
     }
 
     private void finishResolveLocked(String serviceName, long runGeneration) {
-        queuedNames.remove(serviceName);
+        if (serviceName != null) queuedNames.remove(serviceName);
         resolving = false;
         resolveNextLocked(runGeneration);
     }
@@ -363,7 +391,17 @@ public final class NsdBrowser {
         });
     }
 
+    private void postErrorForState(long expectedGeneration, boolean expectedRunning, String message) {
+        mainHandler.post(() -> {
+            synchronized (NsdBrowser.this) {
+                if (generation != expectedGeneration || running != expectedRunning) return;
+            }
+            listener.onDiscoveryError(message);
+        });
+    }
+
     private boolean hasPeerNamedLocked(String serviceName) {
+        if (serviceName == null) return false;
         for (DiscoveredPeer peer : peers.values()) {
             if (peer.serviceName.equals(serviceName)) return true;
         }
@@ -371,7 +409,7 @@ public final class NsdBrowser {
     }
 
     private boolean canTrackNameLocked(String serviceName) {
-        if (serviceName == null || serviceName.isEmpty()) return false;
+        if (validServiceName(serviceName) == null) return false;
         if (queuedNames.contains(serviceName) || retryTasks.containsKey(serviceName)
                 || serviceCallbacks.containsKey(serviceName) || hasPeerNamedLocked(serviceName)) {
             return true;
@@ -385,6 +423,8 @@ public final class NsdBrowser {
     }
 
     private void markLostLocked(String name) {
+        name = validServiceName(name);
+        if (name == null) return;
         pruneLostLocked();
         if (lostNames.size() >= MAX_LOST_TOMBSTONES && !lostNames.containsKey(name)) {
             String oldest = null;
@@ -401,16 +441,19 @@ public final class NsdBrowser {
     }
 
     private boolean isLostLocked(String name) {
+        if (name == null) return false;
         pruneLostLocked();
         return lostNames.containsKey(name);
     }
 
     private void pruneLostLocked() {
-        long cutoff = SystemClock.elapsedRealtime() - LOST_TOMBSTONE_MILLIS;
-        lostNames.entrySet().removeIf(entry -> entry.getValue() < cutoff);
+        long now = SystemClock.elapsedRealtime();
+        lostNames.entrySet().removeIf(entry -> now >= entry.getValue()
+                && now - entry.getValue() > LOST_TOMBSTONE_MILLIS);
     }
 
     private void cancelRetryLocked(String name) {
+        if (name == null) return;
         Runnable retry = retryTasks.remove(name);
         if (retry != null) mainHandler.removeCallbacks(retry);
     }
@@ -423,10 +466,6 @@ public final class NsdBrowser {
         lostNames.clear();
         resolving = false;
         resolveFailures.clear();
-    }
-
-    private void fail(String message) {
-        mainHandler.post(() -> listener.onDiscoveryError(message));
     }
 
     private void releaseLock() {
@@ -442,8 +481,16 @@ public final class NsdBrowser {
         return running && generation == runGeneration;
     }
 
-    private synchronized boolean isCurrentThreadSafe(long runGeneration) {
-        return isCurrent(runGeneration);
+    private static String validServiceName(String name) {
+        if (name == null) return null;
+        String clean = name.trim();
+        if (clean.isEmpty() || clean.length() > 255) return null;
+        return clean;
+    }
+
+    private static boolean isUsableHost(java.net.InetAddress address) {
+        return address != null && !address.isAnyLocalAddress() && !address.isLoopbackAddress()
+                && !address.isMulticastAddress();
     }
 
     private static boolean isOurType(String type) {
@@ -453,7 +500,8 @@ public final class NsdBrowser {
     }
 
     private static String safeMessage(Throwable error) {
-        String text = error.getMessage();
-        return text == null || text.trim().isEmpty() ? error.getClass().getSimpleName() : text;
+        String text = error == null ? null : error.getMessage();
+        return text == null || text.trim().isEmpty()
+                ? error == null ? "unknown" : error.getClass().getSimpleName() : text;
     }
 }

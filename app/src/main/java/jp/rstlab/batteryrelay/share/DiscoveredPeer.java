@@ -24,6 +24,12 @@ public final class DiscoveredPeer {
 
     public DiscoveredPeer(String serviceName, InetAddress host, int port, String shareId,
                           byte[] salt, PublicKey publicKey, Network network) {
+        if (serviceName == null || host == null || shareId == null || salt == null || publicKey == null) {
+            throw new IllegalArgumentException("Peer fields must not be null");
+        }
+        if (port < 1 || port > 65_535 || !isUsableUnicast(host)) {
+            throw new IllegalArgumentException("Invalid peer endpoint");
+        }
         this.serviceName = serviceName;
         this.host = host;
         this.port = port;
@@ -42,8 +48,13 @@ public final class DiscoveredPeer {
     static DiscoveredPeer fromTxt(String serviceName, InetAddress host, int port,
                                   byte[] sid, byte[] saltText, byte[] publicText, Network network)
             throws GeneralSecurityException {
-        if (host == null || port < 1 || port > 65_535 || sid == null || saltText == null || publicText == null) {
+        if (host == null || port < 1 || port > 65_535 || sid == null || saltText == null
+                || publicText == null || !isUsableUnicast(host)) {
             throw new IllegalArgumentException("Incomplete service record");
+        }
+        // TXT records are small by design. Reject unreasonable fields before Base64 allocation.
+        if (sid.length > 64 || saltText.length > 128 || publicText.length > 512) {
+            throw new IllegalArgumentException("Oversized service record");
         }
         String cleanName = serviceName == null ? "" : serviceName
                 .replaceAll("[\\r\\n\\t]", " ").trim();
@@ -51,14 +62,31 @@ public final class DiscoveredPeer {
             throw new IllegalArgumentException("Invalid service name");
         }
         String shareId = new String(sid, java.nio.charset.StandardCharsets.UTF_8);
-        byte[] salt = CryptoBox.unb64(new String(saltText, java.nio.charset.StandardCharsets.UTF_8));
-        byte[] publicBytes = CryptoBox.unb64(new String(publicText, java.nio.charset.StandardCharsets.UTF_8));
-        if (!shareId.matches("[A-Za-z0-9_-]{16}") || salt.length != 16
-                || publicBytes.length > 256) {
-            throw new IllegalArgumentException("Invalid service record");
+        byte[] salt = null;
+        byte[] publicBytes = null;
+        try {
+            salt = CryptoBox.unb64(new String(saltText, java.nio.charset.StandardCharsets.UTF_8));
+            publicBytes = CryptoBox.unb64(new String(publicText,
+                    java.nio.charset.StandardCharsets.UTF_8));
+            if (!shareId.matches("[A-Za-z0-9_-]{16}") || salt.length != 16
+                    || publicBytes.length == 0 || publicBytes.length > 256) {
+                throw new IllegalArgumentException("Invalid service record");
+            }
+            return new DiscoveredPeer(cleanName, host, port, shareId, salt,
+                    CryptoBox.decodePublicKey(publicBytes), network);
+        } catch (IllegalArgumentException malformedBase64) {
+            throw new IllegalArgumentException("Invalid service record", malformedBase64);
+        } finally {
+            if (salt != null) java.util.Arrays.fill(salt, (byte) 0);
+            if (publicBytes != null) java.util.Arrays.fill(publicBytes, (byte) 0);
         }
-        return new DiscoveredPeer(cleanName, host, port, shareId, salt,
-                CryptoBox.decodePublicKey(publicBytes), network);
+    }
+
+    private static boolean isUsableUnicast(InetAddress address) {
+        return address != null
+                && !address.isAnyLocalAddress()
+                && !address.isLoopbackAddress()
+                && !address.isMulticastAddress();
     }
 
     public String stableKey() {
@@ -66,7 +94,11 @@ public final class DiscoveredPeer {
         try {
             byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
                     .digest(publicKey.getEncoded());
-            return shareId + ":" + CryptoBox.b64(digest).substring(0, 16);
+            try {
+                return shareId + ":" + CryptoBox.b64(digest).substring(0, 16);
+            } finally {
+                java.util.Arrays.fill(digest, (byte) 0);
+            }
         } catch (java.security.NoSuchAlgorithmException impossible) {
             throw new IllegalStateException(impossible);
         }

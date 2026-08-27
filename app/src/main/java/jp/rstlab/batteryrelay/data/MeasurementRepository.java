@@ -5,6 +5,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 
+import jp.rstlab.batteryrelay.core.TrendMath;
 import jp.rstlab.batteryrelay.model.BatterySample;
 
 import java.util.Collections;
@@ -40,7 +41,7 @@ public final class MeasurementRepository {
         store = new HistoryStore(context);
     }
 
-    /** Loads/prunes persisted state away from the Android main thread. */
+    /** Loads persisted state away from the Android main thread. */
     public void initializeAsync(Executor executor) {
         if (executor == null) return;
         executor.execute(this::initialize);
@@ -49,21 +50,16 @@ public final class MeasurementRepository {
     public synchronized void initialize() {
         long now = System.currentTimeMillis();
         try {
-            List<BatterySample> loaded = store.readWindow(now);
+            cached = mergeTransientState(store.readWindow(now), now);
             if (liveSample != null) {
-                cached = jp.rstlab.batteryrelay.core.TrendMath.upsertMinuteSample(
-                        loaded, liveSample, now);
                 lastPersistedMinute = Math.floorDiv(liveSample.timestampMillis, 60_000L);
-            } else {
-                cached = loaded;
-                if (!cached.isEmpty()) {
-                    lastPersistedMinute = Math.floorDiv(
-                            cached.get(cached.size() - 1).timestampMillis, 60_000L);
-                }
+            } else if (!cached.isEmpty()) {
+                lastPersistedMinute = Math.floorDiv(
+                        cached.get(cached.size() - 1).timestampMillis, 60_000L);
             }
         } catch (RuntimeException databaseFailure) {
-            // Never overwrite live in-memory data because storage is temporarily unavailable.
-            cached = jp.rstlab.batteryrelay.core.TrendMath.retainWindow(cached, now);
+            // Never overwrite live/in-memory backlog because storage is temporarily unavailable.
+            cached = mergeTransientState(cached, now);
         }
         notifyListeners(cached);
     }
@@ -73,18 +69,20 @@ public final class MeasurementRepository {
         BatterySample sample = reader.read(now);
         lastSampleElapsed = SystemClock.elapsedRealtime();
         long minute = Math.floorDiv(sample.timestampMillis, 60_000L);
-        // Persist the final observed value of the previous minute. This preserves the 1-write/minute
-        // budget while avoiding the stale "first sample of the minute" behavior after restart.
+
         if (minute != lastPersistedMinute) {
-            if (pendingPersistentSample != null) {
-                enqueueForPersistence(pendingPersistentSample);
-            }
+            // Checkpoint the first observation of the new minute in the same transaction that
+            // finalizes the previous minute. A process kill can therefore lose at most the later
+            // refinements of the current minute, not the entire minute.
+            if (pendingPersistentSample != null) enqueueForPersistence(pendingPersistentSample);
+            enqueueForPersistence(sample);
             flushBacklog(now);
             lastPersistedMinute = minute;
         }
+
         pendingPersistentSample = sample;
         liveSample = sample;
-        cached = jp.rstlab.batteryrelay.core.TrendMath.upsertMinuteSample(cached, sample, now);
+        cached = TrendMath.upsertMinuteSample(cached, sample, now);
         sampleRevision.incrementAndGet();
         notifyListeners(cached);
         return sample;
@@ -94,6 +92,7 @@ public final class MeasurementRepository {
     public synchronized BatterySample sampleNowIfOlderThan(long minimumAgeMillis) {
         long elapsed = SystemClock.elapsedRealtime();
         if (lastSampleElapsed != Long.MIN_VALUE
+                && elapsed >= lastSampleElapsed
                 && elapsed - lastSampleElapsed < Math.max(0L, minimumAgeMillis)) {
             return latest();
         }
@@ -103,12 +102,9 @@ public final class MeasurementRepository {
     public synchronized void pruneNow() {
         long now = System.currentTimeMillis();
         try {
-            cached = store.readWindow(now);
+            cached = mergeTransientState(store.readWindow(now), now);
         } catch (RuntimeException ignored) {
-            cached = jp.rstlab.batteryrelay.core.TrendMath.retainWindow(cached, now);
-        }
-        if (liveSample != null) {
-            cached = jp.rstlab.batteryrelay.core.TrendMath.upsertMinuteSample(cached, liveSample, now);
+            cached = mergeTransientState(cached, now);
         }
         notifyListeners(cached);
     }
@@ -160,7 +156,16 @@ public final class MeasurementRepository {
         });
     }
 
+    private List<BatterySample> mergeTransientState(List<BatterySample> base, long now) {
+        ArrayList<BatterySample> merged = new ArrayList<>();
+        if (base != null) merged.addAll(base);
+        merged.addAll(persistenceBacklog);
+        if (liveSample != null) merged.add(liveSample);
+        return TrendMath.coalesceMinuteSamples(merged, now);
+    }
+
     private void enqueueForPersistence(BatterySample sample) {
+        if (sample == null) return;
         long bucket = Math.floorDiv(sample.timestampMillis, 60_000L);
         persistenceBacklog.removeIf(existing ->
                 Math.floorDiv(existing.timestampMillis, 60_000L) == bucket);

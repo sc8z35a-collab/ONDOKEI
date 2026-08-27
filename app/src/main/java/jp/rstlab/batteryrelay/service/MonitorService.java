@@ -52,9 +52,14 @@ public final class MonitorService extends Service {
 
     private final Runnable wakeLockRenewal = new Runnable() {
         @Override public void run() {
-            if (!sampling) return;
+            if (!sampling || worker == null) return;
+            long interval = effectiveIntervalMillis();
+            if (!needsContinuousWakeLock(interval)) {
+                releaseSamplingWakeLockOnly();
+                return;
+            }
             renewSamplingWakeLock();
-            if (sampling && worker != null) worker.postDelayed(this, WAKE_LOCK_RENEW_MILLIS);
+            if (sampling) worker.postDelayed(this, WAKE_LOCK_RENEW_MILLIS);
         }
     };
 
@@ -69,9 +74,11 @@ public final class MonitorService extends Service {
             } catch (RuntimeException ignored) {
                 // A later sample can recover from a transient OEM battery-service failure.
             } finally {
-                if (sampling && generation == samplingGeneration) {
+                if (sampling && generation == samplingGeneration && worker != null) {
+                    long interval = effectiveIntervalMillis();
+                    updateSamplingWakeLock(interval);
                     worker.removeCallbacks(this);
-                    worker.postDelayed(this, effectiveIntervalMillis());
+                    worker.postDelayed(this, interval);
                 }
             }
         }
@@ -114,7 +121,10 @@ public final class MonitorService extends Service {
 
         if (!foregroundStarted) {
             Notification initial = notification(repository.latest());
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, initial,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(NOTIFICATION_ID, initial,
                         ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
             } else {
@@ -127,16 +137,18 @@ public final class MonitorService extends Service {
             notificationManager.notify(NOTIFICATION_ID, notification(repository.latest()));
             lastNotificationAt = SystemClock.elapsedRealtime();
         }
+
         if (!sampling) {
             sampling = true;
             samplingGeneration++;
-            acquireSamplingWakeLock();
             repository.setSamplingActive(true);
+            updateSamplingWakeLock(effectiveIntervalMillis());
             worker.removeCallbacks(sampleTask);
             worker.post(sampleTask);
         } else if (intent != null && (ACTION_REFRESH.equals(intent.getAction())
                 || ACTION_SET_TURBO.equals(intent.getAction()))) {
             // User actions bypass the timer but remain serialized on the one background thread.
+            updateSamplingWakeLock(effectiveIntervalMillis());
             worker.removeCallbacks(sampleTask);
             worker.post(sampleTask);
         }
@@ -169,20 +181,26 @@ public final class MonitorService extends Service {
         releaseSamplingWakeLock();
     }
 
-    private void acquireSamplingWakeLock() {
+    private static boolean needsContinuousWakeLock(long intervalMillis) {
+        // In explicit power/thermal protection mode, keeping the CPU awake defeats the purpose of
+        // backing off to 60 seconds and can itself bias battery temperature/current measurements.
+        return intervalMillis < SamplingPolicy.BACKGROUND_INTERVAL_MILLIS;
+    }
+
+    private void updateSamplingWakeLock(long intervalMillis) {
         if (worker != null) worker.removeCallbacks(wakeLockRenewal);
-        renewSamplingWakeLock();
-        if (sampling && worker != null) {
-            worker.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEW_MILLIS);
+        if (!sampling || !needsContinuousWakeLock(intervalMillis)) {
+            releaseSamplingWakeLockOnly();
+            return;
         }
+        renewSamplingWakeLock();
+        if (worker != null) worker.postDelayed(wakeLockRenewal, WAKE_LOCK_RENEW_MILLIS);
     }
 
     private void renewSamplingWakeLock() {
         PowerManager.WakeLock lock = samplingWakeLock;
         if (lock == null) return;
         try {
-            // Refresh the framework timeout before it can expire. The tiny release/acquire window
-            // is on the already-awake sampler thread and prevents an unbounded lock on bad paths.
             if (lock.isHeld()) lock.release();
             if (sampling) lock.acquire(WAKE_LOCK_TIMEOUT_MILLIS);
         } catch (RuntimeException ignored) {
@@ -192,6 +210,10 @@ public final class MonitorService extends Service {
 
     private void releaseSamplingWakeLock() {
         if (worker != null) worker.removeCallbacks(wakeLockRenewal);
+        releaseSamplingWakeLockOnly();
+    }
+
+    private void releaseSamplingWakeLockOnly() {
         PowerManager.WakeLock lock = samplingWakeLock;
         if (lock == null) return;
         try {
@@ -219,8 +241,6 @@ public final class MonitorService extends Service {
         } catch (RuntimeException ignored) {
             // A vendor service failure must not terminate the sampling worker.
         }
-        // Turbo belongs to the selected source. Keep the local sampler at Normal while a remote
-        // device is selected, then automatically resume local Turbo when the local tab is active.
         boolean localTurbo = turbo
                 && BatteryRelayApp.from(this).remoteDevices().getActiveKey() == null;
         return SamplingPolicy.localInterval(localTurbo, powerSave, lastThermalStatus);
@@ -229,9 +249,11 @@ public final class MonitorService extends Service {
     private void maybeUpdateNotification(BatterySample sample) {
         if (notificationManager == null) return;
         long now = SystemClock.elapsedRealtime();
-        if (now - lastNotificationAt < SamplingPolicy.NOTIFICATION_INTERVAL_MILLIS) return;
-        lastNotificationAt = now;
-        notificationManager.notify(NOTIFICATION_ID, notification(sample));
+        if (now < lastNotificationAt
+                || now - lastNotificationAt >= SamplingPolicy.NOTIFICATION_INTERVAL_MILLIS) {
+            lastNotificationAt = now;
+            notificationManager.notify(NOTIFICATION_ID, notification(sample));
+        }
     }
 
     private Notification notification(BatterySample sample) {

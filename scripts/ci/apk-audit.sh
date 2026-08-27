@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-apk="${1:?usage: apk-audit.sh APK [REPORT_DIR]}"
+apk="${1:?usage: apk-audit.sh APK [REPORT_DIR] [EXPECTED_PACKAGE]}"
 report_dir="${2:-artifacts/static-audit}"
-expected_package="jp.rstlab.batteryrelay.debug"
+expected_package="${3:-jp.rstlab.batteryrelay.debug}"
 mkdir -p "$report_dir"
 
 latest_tool() {
@@ -44,16 +44,25 @@ for permission in \
   android.permission.WAKE_LOCK \
   android.permission.FOREGROUND_SERVICE \
   android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE \
-  android.permission.POST_NOTIFICATIONS \
-  android.permission.ACCESS_LOCAL_NETWORK; do
+  android.permission.FOREGROUND_SERVICE_SPECIAL_USE \
+  android.permission.POST_NOTIFICATIONS; do
   grep -Fq "$permission" "$report_dir/permissions.txt"
 done
+
+# ACCESS_LOCAL_NETWORK is an API 37 dangerous runtime permission. This build targets 36, so the
+# permission must be introduced together with targetSdk 37 runtime UX rather than silently
+# predeclared in the target-36 artifact.
+if grep -Fq 'android.permission.ACCESS_LOCAL_NETWORK' "$report_dir/permissions.txt"; then
+  echo "ACCESS_LOCAL_NETWORK must not be predeclared while targetSdkVersion is 36" >&2
+  exit 1
+fi
 
 grep -Eq ':allowBackup\([^)]*\)=(false|\(type 0x12\)0x0)' \
   "$report_dir/manifest-tree.txt"
 grep -Fq 'jp.rstlab.batteryrelay.service.MonitorService' \
   "$report_dir/manifest-tree.txt"
 grep -Fq ':foregroundServiceType(' "$report_dir/manifest-tree.txt"
+grep -Fq 'android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE' "$report_dir/manifest-tree.txt"
 
 if grep -Eq 'android.permission.(READ|WRITE)_(CONTACTS|CALL_LOG|SMS)|android.permission.RECORD_AUDIO|android.permission.ACCESS_FINE_LOCATION|android.permission.CAMERA' \
   "$report_dir/permissions.txt"; then

@@ -16,6 +16,7 @@ public final class BatteryReader {
     private final PowerManager powerManager;
 
     public BatteryReader(Context context) {
+        if (context == null) throw new IllegalArgumentException("context required");
         this.context = context.getApplicationContext();
         this.batteryManager = this.context.getSystemService(BatteryManager.class);
         this.powerManager = this.context.getSystemService(PowerManager.class);
@@ -31,8 +32,10 @@ public final class BatteryReader {
 
         int level = readPercent(state);
         double temperature = readTemperature(state);
-        double remainingMah = readIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER, 0, 30_000_000) / 1000d;
-        double currentMa = readIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW, -20_000_000, 20_000_000) / 1000d;
+        double remainingMah = readIntProperty(
+                BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER, 0, 30_000_000) / 1000d;
+        double currentMa = readIntProperty(
+                BatteryManager.BATTERY_PROPERTY_CURRENT_NOW, -20_000_000, 20_000_000) / 1000d;
         int voltage = state == null ? 0 : state.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0);
         if (voltage < 0 || voltage > BatterySample.MAX_VOLTAGE_MV) voltage = 0;
         int status = state == null ? BatteryManager.BATTERY_STATUS_UNKNOWN
@@ -58,10 +61,17 @@ public final class BatteryReader {
         if (state != null) {
             int level = state.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
             int scale = state.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
-            if (level >= 0 && scale > 0) return Math.round(level * 100f / scale);
+            if (level >= 0 && scale > 0 && level <= scale) {
+                return Math.max(0, Math.min(100, Math.round(level * 100f / scale)));
+            }
         }
         if (batteryManager != null) {
-            int value = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+            int value;
+            try {
+                value = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY);
+            } catch (RuntimeException ignored) {
+                return -1;
+            }
             if (value != Integer.MIN_VALUE && value >= 0 && value <= 100) return value;
         }
         return -1;
@@ -73,7 +83,8 @@ public final class BatteryReader {
         if (tenths == Integer.MIN_VALUE) return Double.NaN;
         double value = tenths / 10d;
         // Negative values are valid in cold environments. Reject only implausible OEM sentinels.
-        return value >= -40d && value < 90d ? value : Double.NaN;
+        return value >= BatterySample.MIN_TEMPERATURE_C
+                && value <= BatterySample.MAX_TEMPERATURE_C ? value : Double.NaN;
     }
 
     private double readIntProperty(int property, int minInclusive, int maxInclusive) {

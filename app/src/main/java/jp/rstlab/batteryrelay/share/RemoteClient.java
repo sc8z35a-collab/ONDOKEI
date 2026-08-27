@@ -1,17 +1,17 @@
 package jp.rstlab.batteryrelay.share;
 
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.RouteInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.Process;
 import android.os.SystemClock;
-import android.os.PowerManager;
-import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.LinkProperties;
-import android.net.RouteInfo;
 
 import org.json.JSONObject;
 
@@ -22,6 +22,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -60,6 +61,7 @@ public final class RemoteClient {
     private volatile long pollIntervalMillis = SamplingPolicy.NORMAL_INTERVAL_MILLIS;
 
     public RemoteClient(Context context, Listener listener) {
+        if (context == null || listener == null) throw new IllegalArgumentException("context/listener required");
         this.listener = listener;
         Context app = context.getApplicationContext();
         this.powerManager = app.getSystemService(PowerManager.class);
@@ -67,12 +69,17 @@ public final class RemoteClient {
     }
 
     public synchronized void pairAndStart(DiscoveredPeer peer, String sixDigitCode) {
-        disconnect();
         String secret = normalizeSecret(sixDigitCode);
+        if (peer == null) {
+            postError("接続先が見つかりません。端末を再検索してください", true);
+            return;
+        }
         if (!secret.matches("[2-9A-HJ-NP-Z]{26}")) {
             postError("26文字の共有キーを入力してください", true);
             return;
         }
+        // Validate the new request before tearing down an existing authenticated session.
+        disconnect();
         fulfilledFreshGeneration = 0L;
         freshRequestGeneration.incrementAndGet();
         running.set(true);
@@ -112,7 +119,10 @@ public final class RemoteClient {
                 java.util.Arrays.fill(key, (byte) 0);
                 closing.shutdownNow();
             }
-        } else if (closing != null) closing.shutdownNow();
+        } else {
+            if (key != null) java.util.Arrays.fill(key, (byte) 0);
+            if (closing != null) closing.shutdownNow();
+        }
         executor = null;
         if (closing == null && sessionKey != null) java.util.Arrays.fill(sessionKey, (byte) 0);
         sessionKey = null;
@@ -139,7 +149,7 @@ public final class RemoteClient {
         }
     }
 
-    /** Wakes the polling loop and keeps the request pending until a fresh-request response arrives. */
+    /** Wakes the polling loop and keeps the request pending until a valid fresh response arrives. */
     public void requestRefresh() {
         if (!running.get()) return;
         freshRequestGeneration.incrementAndGet();
@@ -172,11 +182,13 @@ public final class RemoteClient {
                 try {
                     DiscoveredPeer endpoint = currentPeer;
                     if (endpoint == null) throw new IOException("peer_missing");
+                    long sequence = nextSequence.getAndIncrement();
                     RemoteSnapshot snapshot = fetch(endpoint, pair.sessionId, pair.key,
-                            nextSequence.getAndIncrement(), forceFresh);
+                            sequence, forceFresh);
                     if (forceFresh) {
-                        // Only the exact fresh requests covered by this successful response are
-                        // consumed. A request arriving during the network call remains pending.
+                        // Only a response that cryptographically echoes this exact sequence and
+                        // fresh flag reaches here, so the user request cannot be consumed by a
+                        // stale/mismatched response.
                         fulfilledFreshGeneration = Math.max(
                                 fulfilledFreshGeneration, requestedFreshGeneration);
                     }
@@ -190,7 +202,8 @@ public final class RemoteClient {
                     consecutiveFailures++;
                     ErrorDecision decision = classifyPollingError(error);
                     // Server error envelopes are not authenticated. Require repetition before a
-                    // remote peer can force us to discard an otherwise valid session.
+                    // remote peer can force us to discard an otherwise valid session. Locally
+                    // detected cryptographic/protocol violations are terminal immediately.
                     boolean terminal = decision.terminal
                             && (!(error instanceof ServerException) || consecutiveFailures >= 3);
                     postErrorIfCurrent(generation, decision.message, terminal);
@@ -221,7 +234,6 @@ public final class RemoteClient {
                 }
                 if (executor == ownedExecutor) executor = null;
             }
-            // A failed initial pairing must not leave an idle non-timeout thread behind.
             ownedExecutor.shutdown();
         }
     }
@@ -230,6 +242,8 @@ public final class RemoteClient {
         KeyPair clientKeys = CryptoBox.generateKeyPair();
         byte[] pairKey = CryptoBox.derivePairKey(clientKeys.getPrivate(), peer.publicKey,
                 peer.salt, code, peer.shareId);
+        byte[] plain = null;
+        byte[] key = null;
         try {
             JSONObject hello = new JSONObject()
                     .put("ts", System.currentTimeMillis())
@@ -249,27 +263,29 @@ public final class RemoteClient {
             if (!response.optBoolean("ok", false)) {
                 throw new ServerException(response.optString("error", "pair_rejected"));
             }
-            byte[] plain = CryptoBox.decrypt(pairKey,
+            plain = CryptoBox.decrypt(pairKey,
                     CryptoBox.unb64(response.getString("nonce")),
                     CryptoBox.unb64(response.getString("box")),
                     CryptoBox.aad("pair-response", peer.shareId));
             JSONObject ack = parseObjectLimited(new String(plain, StandardCharsets.UTF_8));
-            byte[] key = CryptoBox.unb64(ack.getString("key"));
+            key = CryptoBox.unb64(ack.getString("key"));
             if (key.length != CryptoBox.AES_KEY_BYTES) throw new IOException("invalid_session_key");
             String session = ack.getString("session");
             if (!session.matches("[A-Za-z0-9_-]{16}")) {
-                java.util.Arrays.fill(key, (byte) 0);
                 throw new IOException("invalid_session_id");
             }
-            return new PairSession(session, key);
+            PairSession result = new PairSession(session, key);
+            key = null; // ownership moved to PairSession
+            return result;
         } finally {
             java.util.Arrays.fill(pairKey, (byte) 0);
+            if (plain != null) java.util.Arrays.fill(plain, (byte) 0);
+            if (key != null) java.util.Arrays.fill(key, (byte) 0);
         }
     }
 
     private RemoteSnapshot fetch(DiscoveredPeer peer, String sessionId, byte[] key, long sequence,
-                                 boolean forceFresh)
-            throws Exception {
+                                 boolean forceFresh) throws Exception {
         String aadId = sessionId + "/" + sequence;
         JSONObject inner = new JSONObject().put("ts", System.currentTimeMillis())
                 .put("seq", sequence).put("fresh", forceFresh);
@@ -284,17 +300,43 @@ public final class RemoteClient {
                 .put("seq", sequence)
                 .put("nonce", CryptoBox.b64(nonce))
                 .put("box", CryptoBox.b64(box));
+        long requestElapsed = SystemClock.elapsedRealtime();
         JSONObject response = send(peer, request);
+        long responseElapsed = SystemClock.elapsedRealtime();
+        long receivedAt = System.currentTimeMillis();
         if (!response.optBoolean("ok", false)) {
             throw new ServerException(response.optString("error", "snapshot_rejected"));
         }
-        byte[] plain = CryptoBox.decrypt(key,
-                CryptoBox.unb64(response.getString("nonce")),
-                CryptoBox.unb64(response.getString("box")),
-                CryptoBox.aad("snapshot-response", aadId));
-        return RemoteSnapshot.fromJson(parseObjectLimited(
-                        new String(plain, StandardCharsets.UTF_8)),
-                System.currentTimeMillis());
+        byte[] plain = null;
+        try {
+            plain = CryptoBox.decrypt(key,
+                    CryptoBox.unb64(response.getString("nonce")),
+                    CryptoBox.unb64(response.getString("box")),
+                    CryptoBox.aad("snapshot-response", aadId));
+            long rtt = responseElapsed >= requestElapsed ? responseElapsed - requestElapsed : 0L;
+            long mappingReference = midpointReference(receivedAt, rtt);
+            RemoteSnapshot snapshot = RemoteSnapshot.fromJson(
+                    parseObjectLimited(new String(plain, StandardCharsets.UTF_8)),
+                    receivedAt, mappingReference);
+            if (snapshot.requestSequence != sequence) {
+                throw new ProtocolViolationException("snapshot_sequence_mismatch");
+            }
+            if (snapshot.freshRequested != forceFresh) {
+                throw new ProtocolViolationException("snapshot_fresh_mismatch");
+            }
+            return snapshot;
+        } finally {
+            if (plain != null) java.util.Arrays.fill(plain, (byte) 0);
+        }
+    }
+
+    private static long midpointReference(long receivedAt, long rttMillis) {
+        long half = Math.max(0L, rttMillis) / 2L;
+        try {
+            return Math.subtractExact(receivedAt, half);
+        } catch (ArithmeticException overflow) {
+            return Long.MIN_VALUE;
+        }
     }
 
     private void waitForNextPoll() throws InterruptedException {
@@ -310,14 +352,10 @@ public final class RemoteClient {
         }
     }
 
-    /**
-     * Backs off the failed request even when that same fresh request remains pending. A newly
-     * requested refresh (generation greater than the failed request) can still wake the delay.
-     */
     private void waitForDelay(long delayMillis, long failedFreshGeneration)
             throws InterruptedException {
         synchronized (scheduleLock) {
-            long deadline = SystemClock.elapsedRealtime() + delayMillis;
+            long deadline = SystemClock.elapsedRealtime() + Math.max(0L, delayMillis);
             while (running.get()) {
                 if (freshRequestGeneration.get() > failedFreshGeneration) break;
                 long remaining = deadline - SystemClock.elapsedRealtime();
@@ -352,6 +390,7 @@ public final class RemoteClient {
     }
 
     private JSONObject send(DiscoveredPeer peer, JSONObject request) throws Exception {
+        if (peer == null || request == null) throw new IOException("peer_missing");
         try (Socket socket = createWifiSocket(peer)) {
             socket.connect(new InetSocketAddress(peer.host, peer.port), 5_000);
             socket.setSoTimeout(7_000);
@@ -367,23 +406,31 @@ public final class RemoteClient {
     private Socket createWifiSocket(DiscoveredPeer peer) throws IOException {
         ConnectivityManager manager = connectivityManager;
         if (manager == null) throw new IOException("wifi_unavailable");
-        if (peer.network != null && isWifi(manager, peer.network)) {
+        if (peer.network != null && isWifi(manager, peer.network)
+                && hasRoute(manager, peer.network, peer.host)) {
             return peer.network.getSocketFactory().createSocket();
         }
         Network active = manager.getActiveNetwork();
-        if (isWifi(manager, active)) return active.getSocketFactory().createSocket();
-        Network fallback = null;
+        if (isWifi(manager, active) && hasRoute(manager, active, peer.host)) {
+            return active.getSocketFactory().createSocket();
+        }
         for (Network candidate : manager.getAllNetworks()) {
-            if (!isWifi(manager, candidate)) continue;
-            if (fallback == null) fallback = candidate;
-            LinkProperties links = manager.getLinkProperties(candidate);
-            if (links == null) continue;
-            for (RouteInfo route : links.getRoutes()) {
-                if (route.matches(peer.host)) return candidate.getSocketFactory().createSocket();
+            if (isWifi(manager, candidate) && hasRoute(manager, candidate, peer.host)) {
+                return candidate.getSocketFactory().createSocket();
             }
         }
-        if (fallback != null) return fallback.getSocketFactory().createSocket();
-        throw new IOException("wifi_unavailable");
+        throw new IOException("wifi_route_unavailable");
+    }
+
+    private static boolean hasRoute(ConnectivityManager manager, Network network,
+                                    java.net.InetAddress host) {
+        if (network == null || host == null) return false;
+        LinkProperties links = manager.getLinkProperties(network);
+        if (links == null) return false;
+        for (RouteInfo route : links.getRoutes()) {
+            if (route != null && route.matches(host)) return true;
+        }
+        return false;
     }
 
     private static boolean isWifi(ConnectivityManager manager, Network network) {
@@ -406,6 +453,14 @@ public final class RemoteClient {
         if (error instanceof SecurityException) {
             return new ErrorDecision(
                     "ローカルネットワーク権限がありません。Androidの権限設定を確認してください",
+                    true, 0L);
+        }
+        if (error instanceof GeneralSecurityException
+                || error instanceof org.json.JSONException
+                || error instanceof ProtocolViolationException
+                || error instanceof IllegalArgumentException) {
+            return new ErrorDecision(
+                    "共有元の暗号応答を検証できません。安全のため接続を終了します",
                     true, 0L);
         }
         if (!(error instanceof ServerException)) {
@@ -439,6 +494,11 @@ public final class RemoteClient {
         if (error instanceof SecurityException) {
             return "ローカルネットワーク権限がありません。Androidの権限設定を確認してください";
         }
+        if (error instanceof GeneralSecurityException
+                || error instanceof org.json.JSONException
+                || error instanceof ProtocolViolationException) {
+            return "共有元の暗号応答を検証できません。端末を再検索してください";
+        }
         if (error instanceof ServerException) {
             String code = ((ServerException) error).code;
             if ("stale_share".equals(code)) return "共有情報が更新されました。端末を再検索してください";
@@ -468,6 +528,7 @@ public final class RemoteClient {
     }
 
     private static JSONObject parseObjectLimited(String text) throws org.json.JSONException {
+        if (text == null) throw new org.json.JSONException("missing_json");
         int depth = 0;
         boolean quoted = false;
         boolean escaped = false;
@@ -536,6 +597,11 @@ public final class RemoteClient {
             super(code);
             this.code = code;
         }
+    }
+
+    private static final class ProtocolViolationException extends IOException {
+        private static final long serialVersionUID = 1L;
+        ProtocolViolationException(String code) { super(code); }
     }
 
     private static final class PairSession {

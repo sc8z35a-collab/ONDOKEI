@@ -9,9 +9,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Android 17 / targetSdk 37+: raw local-network access becomes runtime-controlled. -->
-    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <!-- targetSdk is 36. Add ACCESS_LOCAL_NETWORK together with its runtime UX when moving to 37+. -->
 
     <uses-feature
         android:name="android.hardware.wifi"
@@ -41,7 +41,11 @@
         <service
             android:name=".service.MonitorService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice"
-            android:stopWithTask="false" />
+            android:foregroundServiceType="connectedDevice|specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-visible continuous local battery level, current and temperature sampling at 5-60 second intervals" />
+        </service>
     </application>
 </manifest>

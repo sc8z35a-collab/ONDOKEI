@@ -8,7 +8,6 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # A branch push and its PR synchronize event share one group, avoiding duplicate emulator cost.
   group: ondokei-audit-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
@@ -19,7 +18,7 @@ jobs:
   build-and-static-audit:
     name: Build, unit tests, lint and APK audit
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Restore executable bits
@@ -32,16 +31,39 @@ jobs:
       - uses: android-actions/setup-android@v3
       - name: Install Android SDK 36 build tools
         run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
-      - name: Unit tests, lint and APK/test APK build
-        run: ./gradlew --stacktrace testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
-      - name: Verify APK structure, signature, manifest, permissions and SDK levels
-        run: bash scripts/ci/apk-audit.sh app/build/outputs/apk/debug/app-debug.apk artifacts/static-audit
+      - name: Create ephemeral CI release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -noprompt \
+            -keystore "$RUNNER_TEMP/ondokei-ci-release.jks" \
+            -storepass ci-audit-pass -keypass ci-audit-pass \
+            -alias ci-audit -keyalg RSA -keysize 3072 -validity 2 \
+            -dname 'CN=ONDOKEI CI Audit,O=RST Lab,C=JP'
+          {
+            echo "BATTERY_RELAY_RELEASE_KEYSTORE=$RUNNER_TEMP/ondokei-ci-release.jks"
+            echo 'BATTERY_RELAY_STORE_PASSWORD=ci-audit-pass'
+            echo 'BATTERY_RELAY_KEY_ALIAS=ci-audit'
+            echo 'BATTERY_RELAY_KEY_PASSWORD=ci-audit-pass'
+          } >> "$GITHUB_ENV"
+      - name: Unit tests, lint, debug/release APK and test APK build
+        run: ./gradlew --stacktrace testDebugUnitTest lintDebug lintRelease assembleDebug assembleRelease assembleDebugAndroidTest
+      - name: Verify debug APK structure, signature, manifest, permissions and SDK levels
+        run: bash scripts/ci/apk-audit.sh app/build/outputs/apk/debug/app-debug.apk artifacts/static-audit-debug jp.rstlab.batteryrelay.debug
+      - name: Verify release-path APK with disposable CI key
+        run: bash scripts/ci/apk-audit.sh app/build/outputs/apk/release/app-release.apk artifacts/static-audit-release jp.rstlab.batteryrelay
+      - name: Record exact verified revision
+        run: |
+          mkdir -p artifacts/verification
+          printf '%s\n' "$GITHUB_SHA" | tee artifacts/verification/commit-sha.txt
+          printf '%s\n' "${GITHUB_REF_NAME:-unknown}" | tee artifacts/verification/ref-name.txt
       - name: Collect reports
         if: always()
         run: |
           mkdir -p artifacts/gradle-reports artifacts/apks
           cp -R app/build/reports/. artifacts/gradle-reports/ 2>/dev/null || true
           cp app/build/outputs/apk/debug/app-debug.apk artifacts/apks/ 2>/dev/null || true
+          cp app/build/outputs/apk/release/app-release.apk artifacts/apks/app-ci-release-test-key.apk 2>/dev/null || true
           cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk artifacts/apks/ 2>/dev/null || true
       - name: Upload build and static audit artifacts
         if: always()
@@ -92,8 +114,6 @@ jobs:
           disk-size: 4096M
           heap-size: 768M
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          # The runner executes each `script` line separately, so all stateful work and the
-          # EXIT trap live in one checked-in script invoked by this single command.
           script: scripts/ci/run-emulator-audit.sh ${{ matrix.api-level }} downloaded/apks/app-debug.apk downloaded/apks/app-debug-androidTest.apk artifacts/api-${{ matrix.api-level }}
       - name: Confirm failure diagnostics were collected before emulator shutdown
         if: always()
