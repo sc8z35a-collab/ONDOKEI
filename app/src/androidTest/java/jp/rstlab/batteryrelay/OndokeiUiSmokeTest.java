@@ -62,11 +62,12 @@ public final class OndokeiUiSmokeTest {
 
             scenario.onActivity(activity -> activity.setRequestedOrientation(
                     ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE));
-            onView(withText("端末コンディション")).check(matches(isDisplayed()));
+            onView(withText("端末コンディション")).perform(scrollTo())
+                    .check(matches(isDisplayed()));
             scenario.onActivity(activity -> activity.setRequestedOrientation(
                     ActivityInfo.SCREEN_ORIENTATION_PORTRAIT));
             onView(withContentDescription("Turboモードを切り替え"))
-                    .check(matches(isDisplayed()));
+                    .perform(scrollTo()).check(matches(isDisplayed()));
         }
     }
 
