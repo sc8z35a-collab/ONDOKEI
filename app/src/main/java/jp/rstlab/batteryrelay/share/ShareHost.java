@@ -72,6 +72,7 @@ public final class ShareHost {
     private static final int MAX_SNAPSHOT_REQUESTS_PER_SESSION_PER_MINUTE = 30;
     private static final int MAX_RATE_LIMIT_BUCKETS = 1024;
     private static final int CLIENT_READ_TIMEOUT_MILLIS = 1_500;
+    private static final long REQUEST_DEADLINE_MILLIS = 4_000L;
 
     private final Context context;
     private final MeasurementRepository repository;
@@ -436,7 +437,6 @@ public final class ShareHost {
             try {
                 Socket client = listening.accept();
                 InetAddress remoteAddress = client.getInetAddress();
-                String address = remoteAddress == null ? "unknown" : remoteAddress.getHostAddress();
                 String rateAddress = rateLimitKey(remoteAddress);
                 Semaphore slots = clientSlots;
                 Map<String, AtomicInteger> addressCounters = activeAddresses;
@@ -444,12 +444,14 @@ public final class ShareHost {
                     closeQuietly(client);
                     continue;
                 }
-                if (!acquireAddress(addressCounters, address)) {
+                // The same /64 is one actor for IPv6 rate limiting and active connection limits.
+                // Otherwise a LAN peer can rotate privacy addresses to occupy all worker slots.
+                if (!acquireAddress(addressCounters, rateAddress)) {
                     closeQuietly(client);
                     continue;
                 }
                 if (!slots.tryAcquire()) {
-                    releaseAddress(addressCounters, address);
+                    releaseAddress(addressCounters, rateAddress);
                     closeQuietly(client);
                     continue;
                 }
@@ -464,19 +466,19 @@ public final class ShareHost {
                             finally {
                                 openClients.remove(client);
                                 slots.release();
-                                releaseAddress(addressCounters, address);
+                                releaseAddress(addressCounters, rateAddress);
                             }
                         });
                     } catch (RejectedExecutionException overloaded) {
                         openClients.remove(client);
                         slots.release();
-                        releaseAddress(addressCounters, address);
+                        releaseAddress(addressCounters, rateAddress);
                         closeQuietly(client);
                     }
                 } else {
                     openClients.remove(client);
                     slots.release();
-                    releaseAddress(addressCounters, address);
+                    releaseAddress(addressCounters, rateAddress);
                     closeQuietly(client);
                 }
             } catch (IOException error) {
@@ -491,7 +493,7 @@ public final class ShareHost {
     private void handleClient(Socket socket, String address, long generation) {
         try (Socket client = socket) {
             try {
-                String line = readLineLimited(client.getInputStream());
+                String line = readLineLimited(client.getInputStream(), REQUEST_DEADLINE_MILLIS);
                 JSONObject request = parseObjectLimited(line);
                 if (!isCurrent(generation)) throw new ProtocolException("host_stopped");
                 if (request.optInt("v", -1) != 1) throw new ProtocolException("unsupported_version");
@@ -680,8 +682,6 @@ public final class ShareHost {
                     && nowElapsed - prior < MIN_FRESH_INTERVAL_MILLIS) return false;
             if (lastGlobalFreshElapsed.compareAndSet(prior, nowElapsed)) {
                 if (session.commitFresh(nowElapsed, MIN_FRESH_INTERVAL_MILLIS)) return true;
-                // Another request for this same session won the race after canFresh(). Give the
-                // global reservation back if nobody else has advanced it.
                 lastGlobalFreshElapsed.compareAndSet(nowElapsed, prior);
                 return false;
             }
@@ -801,7 +801,7 @@ public final class ShareHost {
         String maker = Build.MANUFACTURER == null ? "Android" : Build.MANUFACTURER.trim();
         String model = Build.MODEL == null ? "端末" : Build.MODEL.trim();
         String value = maker.equalsIgnoreCase(model) ? model : maker + " " + model;
-        value = value.replaceAll("[\\r\\n\\t]", " ").trim();
+        value = value.replaceAll("[\r\n\t]", " ").trim();
         if (value.isEmpty()) return "Android 端末";
         return value.codePointCount(0, value.length()) <= 48 ? value
                 : value.substring(0, value.offsetByCodePoints(0, 48));
@@ -824,17 +824,28 @@ public final class ShareHost {
         return prefix + (clipped.length() == 0 ? "Android" : clipped);
     }
 
-    private static String readLineLimited(InputStream input) throws IOException {
+    static String readLineLimited(InputStream input, long deadlineMillis) throws IOException {
         if (input == null) throw new IOException("missing_input");
+        if (deadlineMillis <= 0L) throw new IOException("request_deadline");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(1024);
+        long started = System.nanoTime();
         int value;
         while ((value = input.read()) != -1) {
+            if (elapsedMillis(started) > deadlineMillis) {
+                throw new IOException("request_deadline");
+            }
             if (value == '\n') break;
             if (value != '\r') bytes.write(value);
             if (bytes.size() > MAX_LINE_BYTES) throw new IOException("message_too_large");
         }
         if (bytes.size() == 0 && value == -1) throw new IOException("empty_request");
         return bytes.toString(StandardCharsets.UTF_8.name());
+    }
+
+    private static long elapsedMillis(long startedNanos) {
+        long elapsed = System.nanoTime() - startedNanos;
+        if (elapsed < 0L) return Long.MAX_VALUE;
+        return elapsed / 1_000_000L;
     }
 
     private static JSONObject parseObjectLimited(String text) throws JSONException {
