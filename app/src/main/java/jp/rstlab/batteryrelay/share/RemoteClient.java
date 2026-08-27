@@ -189,13 +189,18 @@ public final class RemoteClient {
                 } catch (Exception error) {
                     consecutiveFailures++;
                     ErrorDecision decision = classifyPollingError(error);
-                    postErrorIfCurrent(generation, decision.message, decision.terminal);
-                    if (decision.terminal) break;
+                    // Server error envelopes are not authenticated. Require repetition before a
+                    // remote peer can force us to discard an otherwise valid session.
+                    boolean terminal = decision.terminal
+                            && (!(error instanceof ServerException) || consecutiveFailures >= 3);
+                    postErrorIfCurrent(generation, decision.message, terminal);
+                    if (terminal) break;
                     try {
                         waitForDelay(decision.retryDelayMillis > 0L
                                 ? decision.retryDelayMillis
                                 : Math.min(60_000L,
-                                2_000L << Math.min(5, consecutiveFailures - 1)));
+                                2_000L << Math.min(5, consecutiveFailures - 1)),
+                                requestedFreshGeneration);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         break;
@@ -305,10 +310,16 @@ public final class RemoteClient {
         }
     }
 
-    private void waitForDelay(long delayMillis) throws InterruptedException {
+    /**
+     * Backs off the failed request even when that same fresh request remains pending. A newly
+     * requested refresh (generation greater than the failed request) can still wake the delay.
+     */
+    private void waitForDelay(long delayMillis, long failedFreshGeneration)
+            throws InterruptedException {
         synchronized (scheduleLock) {
             long deadline = SystemClock.elapsedRealtime() + delayMillis;
-            while (running.get() && !hasPendingFreshRequest()) {
+            while (running.get()) {
+                if (freshRequestGeneration.get() > failedFreshGeneration) break;
                 long remaining = deadline - SystemClock.elapsedRealtime();
                 if (remaining <= 0L) break;
                 scheduleLock.wait(remaining);
