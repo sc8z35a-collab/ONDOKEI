@@ -39,6 +39,7 @@ public final class MonitorService extends Service {
     private static final long WAKE_LOCK_RENEW_MILLIS = 5L * 60L * 1000L;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExplicitStopState explicitStopState = new ExplicitStopState();
     private HandlerThread workerThread;
     private Handler worker;
     private MeasurementRepository repository;
@@ -48,8 +49,6 @@ public final class MonitorService extends Service {
     private volatile boolean sampling;
     private volatile boolean turbo;
     private boolean foregroundStarted;
-    private volatile boolean explicitStopInProgress;
-    private volatile int latestExplicitStopStartId;
     private volatile int lastThermalStatus = -1;
     private long lastNotificationAt;
     private volatile long samplingGeneration;
@@ -116,10 +115,9 @@ public final class MonitorService extends Service {
             return START_NOT_STICKY;
         }
 
-        // A new non-stop command supersedes any pending explicit-stop completion. The sampler
-        // generation advances again below because beginExplicitStop() made sampling false; that
-        // prevents an old flush callback from removing the foreground notification of this restart.
-        explicitStopInProgress = false;
+        // Any new non-stop command supersedes a pending shutdown generation. If a flush from that
+        // older STOP completes later, it can no longer remove this run's foreground notification.
+        explicitStopState.cancel();
         if (intent != null && ACTION_SET_TURBO.equals(intent.getAction())) {
             turbo = intent.getBooleanExtra(EXTRA_TURBO, false);
         }
@@ -163,13 +161,12 @@ public final class MonitorService extends Service {
     }
 
     private void beginExplicitStop(int startId) {
-        // Duplicate STOP commands must advance the startId used by stopSelfResult(). Otherwise the
-        // first stop can finish with a stale id and leave a non-sampling Service instance alive.
-        latestExplicitStopStartId = startId;
-        if (explicitStopInProgress) return;
-        explicitStopInProgress = true;
+        long stopGeneration = explicitStopState.begin(startId);
+        // Duplicate STOP commands update the state machine's latest startId, but must not enqueue
+        // another flush. The first completion will stop against that newest id.
+        if (stopGeneration == ExplicitStopState.ALREADY_IN_PROGRESS) return;
         sampling = false;
-        long stopGeneration = ++samplingGeneration;
+        samplingGeneration++;
         if (repository != null) repository.setSamplingActive(false);
         Handler background = worker;
         if (background != null) {
@@ -189,11 +186,10 @@ public final class MonitorService extends Service {
     }
 
     private void completeExplicitStop(long stopGeneration) {
-        // onStartCommand() runs on this same main thread. If a START/REFRESH/TURBO command arrived
-        // after the stop was queued, it cleared explicitStopInProgress and advanced the sampling
-        // generation before restarting. Never let the old stop tear down that new foreground run.
-        if (!explicitStopInProgress || samplingGeneration != stopGeneration) return;
-        int stopStartId = latestExplicitStopStartId;
+        // onStartCommand() and this callback share the main thread. A newer non-stop command first
+        // cancels the state generation, making the stale completion a no-op.
+        int stopStartId = explicitStopState.completionStartId(stopGeneration);
+        if (stopStartId < 0) return;
         stopForeground(STOP_FOREGROUND_REMOVE);
         foregroundStarted = false;
         stopSelfResult(stopStartId);
@@ -204,7 +200,7 @@ public final class MonitorService extends Service {
         BatteryRelayApp app = BatteryRelayApp.from(this);
         app.shareHost().stop();
         app.remoteDevices().disconnectAll();
-        if (!explicitStopInProgress) stopSampling();
+        if (!explicitStopState.isInProgress()) stopSampling();
         else releaseSamplingWakeLock();
         if (workerThread != null) workerThread.quitSafely();
         super.onDestroy();
