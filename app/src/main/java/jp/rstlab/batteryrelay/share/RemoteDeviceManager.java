@@ -93,6 +93,7 @@ public final class RemoteDeviceManager {
                     Connection current = connections.get(key);
                     if (current == null || current.client != connection.client) return;
                     current.connected = true;
+                    maybeStopRecoveryLocked();
                     publishLocked();
                     postMessageLocked(key, "接続しました", false);
                 }
@@ -106,6 +107,7 @@ public final class RemoteDeviceManager {
                     current.connected = true;
                     current.snapshot = snapshot;
                     current.displayName = snapshot.deviceName;
+                    maybeStopRecoveryLocked();
                     publishLocked();
                 }
             }
@@ -119,6 +121,7 @@ public final class RemoteDeviceManager {
                         connections.remove(key, current);
                         if (key.equals(activeKey)) activeKey = null;
                         current.client.disconnect();
+                        if (connections.isEmpty()) stopRecoveryLocked();
                     } else {
                         startRecoveryDiscoveryLocked();
                     }
@@ -175,7 +178,10 @@ public final class RemoteDeviceManager {
                 updated = true;
             }
         }
-        if (updated && recoveryBrowser != null) stopRecoveryLocked();
+        // Do not stop recovery merely because one of several connections was rediscovered. The
+        // browser stays alive until every currently failed connection has actually produced a
+        // successful pairing/snapshot, or until its bounded 15-second recovery window ends.
+        if (updated) publishLocked();
     }
 
     public synchronized void disconnect(String key) {
@@ -184,6 +190,8 @@ public final class RemoteDeviceManager {
         if (connection == null) return;
         connection.client.disconnect();
         if (key.equals(activeKey)) activeKey = null;
+        if (connections.isEmpty()) stopRecoveryLocked();
+        else maybeStopRecoveryLocked();
         updateIntervalsLocked();
         publishLocked();
     }
@@ -237,8 +245,6 @@ public final class RemoteDeviceManager {
 
             @Override public void onDiscoveryError(String message) {
                 synchronized (RemoteDeviceManager.this) {
-                    // Allow the next transport failure to retry discovery immediately rather than
-                    // being blocked by a dead browser until the 15-second timer fires.
                     if (recoveryBrowser != null) stopRecoveryLocked();
                 }
             }
@@ -247,6 +253,14 @@ public final class RemoteDeviceManager {
         browser.start();
         mainHandler.removeCallbacks(stopRecovery);
         mainHandler.postDelayed(stopRecovery, 15_000L);
+    }
+
+    private void maybeStopRecoveryLocked() {
+        if (recoveryBrowser == null) return;
+        for (Connection connection : connections.values()) {
+            if (!connection.connected) return;
+        }
+        stopRecoveryLocked();
     }
 
     private void stopRecoveryLocked() {
