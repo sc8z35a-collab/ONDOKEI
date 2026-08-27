@@ -1,56 +1,156 @@
-# Battery Relay 1.3.0 検証記録
+# Battery Relay 1.3.1 検証記録
 
-検証日: 2026-08-27
+検証日: 2026-08-28 (JST)
 
-## 自動検証
+コード検証対象: `0c8e356d17110cf01dd62869d9357b1b93626400`
 
-- Gradle Javaコンパイル・APK組立: 成功
-- JUnit 4: 14件成功、失敗0、スキップ0
-- Android Lint: 問題0
-- 決定的乱択試験: 100,000履歴窓、2,000件のAES-GCM暗号文/AAD改ざん、50,000共有キーを検証
-- 独立コア自己テスト: 30分境界、ライブ点置換、更新間隔保護、分単位傾き、ECDH鍵一致、AES-GCM往復、異なる共有キー拒否を確認
-- APK 署名検証: v2/v3 成功
-- APK zipalign 検証: 成功
-- Manifest 検査: package、versionCode 4、minSdk 26、targetSdk 36、権限、非exportサービスを確認
-- PackageParser互換検査: `foregroundServiceType` が文字列ではなく正式なflags値 `0x10` であることを確認
-- 静的電力監査: CPU WakeLock/AlarmManager/定期Job/位置情報なし、探索中だけのMulticastLock解放、DB・通知1分制限、バックグラウンドスレッド優先度を確認
-- 競合監査: 共有世代番号、停止時ソケット閉鎖、原子的8セッション上限、原子的IP試行制限、8接続枠、5秒更新制限を確認
-- 回復監査: 一時Wi-Fi断で鍵を保持、最大60秒バックオフ、障害時15秒NSD再解決、明示切断時の暗号化ログアウトを確認
-- 時計監査: セッション・試行・通知を単調時計へ移行し、未来DB行削除と共有時刻の受信側再基準化を確認
+## 結論
 
-## 単体テスト対象
+前回のウルトラ監査で特定した不具合群に対する修正を実装し、GitHub Actions の `ONDOKEI full system audit` でビルド、JUnit、Android Lint、APK静的監査、Android Emulator API 35 上の instrumentation/UI・ライフサイクル・通信断復帰・Foreground Service/WakeLock・クラッシュ/ANR監査を実行しました。
 
-1. 30分境界を含め、それ以前を除外する保持ロジック
-2. 実経過90秒の値から正しい `/分` を算出するロジック
-3. 温度取得不可の中間点を安全に読み飛ばすロジック
-4. ペア両端の ECDH/HKDF 鍵一致、AES-GCM 往復、異なる128ビット共有キーでの認証失敗
-5. 同一分のライブ点が1点だけ置換されること
-6. 通常15秒、Turbo 5秒、省電力/重度熱状態60秒のポリシー
-7. 非選択・画面非表示の共有先が60秒へ退避すること
-8. 30分窓と最大31点の二重上限
-9. 未来点の拒否、残量取得不可と0%の区別、氷点下温度の有効性
-10. 入力順が崩れた履歴でも正しい変化率を算出すること
-11. 無限大・範囲外の温度、電流、電圧、容量、熱状態をモデル境界で無効化すること
-12. `Long.MIN_VALUE` 近傍の時刻でも30分窓計算がオーバーフローしないこと
-13. P-256以外のECDH公開鍵を拒否すること
-14. 同一分の重複を最新点へ集約し、最大31点へ制限すること
+コード検証対象commitでは、ビルド/単体テスト/Lint/APK監査ジョブは `success`、Emulator の実検査ステップもすべて `success` です。push run #53 は PR #2 作成後に同一workflowのconcurrency制御で置き換えられたためrun全体は `cancelled` 表示になりましたが、キャンセル前に Emulator の検査本体、診断採取、Artifact upload を含む全stepが成功しています。PR側では同一headを再検証します。
 
-## 残る実機確認
+「バグゼロ」を数学的に保証するものではありませんが、監査で具体的に再現・特定した問題には修正と回帰防止を入れ、CIで検証可能な範囲は通過しています。
 
-この環境には Android 実機／エミュレーターが接続されていないため、メーカー固有のバッテリー値、バックグラウンド制限、ルーターの multicast/AP isolation、2台間 DNS-SD は未実測です。APK のビルド・静的解析・JVM ロジック・署名は検証済みですが、「バグゼロ」を文字どおり保証するものではありません。
+## 自動検証結果
 
-実機では最低限、次を確認してください。
+- Gradle Javaコンパイル: 成功
+- `testDebugUnitTest`: 成功
+- Android Lint (`lintDebug`): 成功
+- Debug APK / instrumentation APK 組立: 成功
+- Gradle build: `BUILD SUCCESSFUL`
+- APK ZIP integrity: 成功
+- zipalign 4-byte alignment: 成功
+- APK署名検証: Debug APK の v2 signature 成功
+- APK監査: package / SDK / Manifest / permission / service 宣言すべて成功
+- package: `jp.rstlab.batteryrelay.debug`
+- versionCode: `5`
+- versionName: `1.3.1-debug`
+- minSdk: `26`
+- targetSdk: `36`
+- compileSdk: `36`
+- `MonitorService`: non-exported / connectedDevice Foreground Service
+- `allowBackup=false`, `usesCleartextTraffic=false` を確認
+- `WAKE_LOCK`, `FOREGROUND_SERVICE_CONNECTED_DEVICE`, `ACCESS_LOCAL_NETWORK` を含む意図した権限セットを確認
+- 連絡先・SMS・通話履歴・録音・カメラ・精密位置など、想定外のプライバシー権限なし
 
-- 30分経過後に最古点が消える
-- 充電／放電時の符号と温度値が端末表示と妥当な範囲で一致する
-- 画面消灯後も通知が残り、1分データが継続する
-- 同じ Wi‑Fi の2台で自動発見、誤共有キー拒否、正しい共有キーで接続できる
-- 共有停止直後に共有先の次回取得が失敗し、ローカル表示へ戻る
-- ライト／ダーク、縦横、表示サイズ変更で切れや重なりがない
-- Normal/Turboを各10分以上測り、CPU使用率とバッテリー温度上昇を比較する（`tools/power-audit-windows.ps1`）
+## Emulator API 35 動的監査
 
-## 配布APK
+GitHub-hosted Android Emulator で次を実行し、検査本体はすべて成功しました。
 
-`BatteryRelay-1.3.0.apk`
+- APK / test APK インストール
+- instrumentation / UI smoke test
+- 通知権限の拒否状態で初回起動
+- 通知権限許可後の再起動
+- MainActivity 起動確認
+- MonitorService が Foreground Service として維持されること
+- 継続計測用 Partial WakeLock が保持されること
+- HOME によるバックグラウンド化後も Service / WakeLock が維持されること
+- 画面回転
+- アプリ復帰
+- Wi-Fi / data 無効化と復帰
+- trim-memory COMPLETE 相当
+- force-stop 後の再起動
+- 再起動後の Service / WakeLock 再取得
+- logcat / crash buffer から対象アプリの Java crash / native crash / ANR がないこと
+- Activity / Service / memory / notification / UI hierarchy / screenshot の診断採取
 
-SHA-256: `815dfd75d4cdafe34be88b219ffb4cebe3d76f36d50190d80cc972b4ed4855c8`
+## 今回追加した回帰検査
+
+### 計測と履歴
+
+- 最新サンプルの温度が取得不可なら、過去の2点だけから古い温度変化率を現在値として表示しない
+- 最新バッテリー値が取得不可の場合も同様に古い変化率を現在値として出さない
+- 実測時刻差から `/分` の変化率を計算する
+- 30分窓、1分バケット、最大31点を維持する
+- システム時計を巻き戻して既存行が一時的に未来扱いになっても、正常履歴を即座に物理削除しない
+- 現在窓の表示/共有から未来点は除外する
+- SQLite全体は最大31行へ制限する
+- Main ThreadでApplication起動時のSQLite読み込みを行わない
+- Service停止時のSQLite flushをMain Threadで行わない
+- listener解除後にpost済み初期callbackが古いActivityへ届かない
+
+### 継続計測
+
+- Foreground Service中のみ `PARTIAL_WAKE_LOCK` を利用する
+- WakeLockは10分の安全timeout付きで、計測継続中は5分ごとにrenewする
+- Service停止時にWakeLockを即解放する
+- deep sleepでもHandlerThreadがCPU停止だけを理由に長時間止まらない設計へ変更
+- 省電力/重度以上の熱状態では60秒へ退避する
+
+### リモート共有
+
+- TCP応答受信時刻と最新測定時刻を分離する
+- 古い測定値を新しく受信しても「たった今更新」と表示しない
+- 手動fresh要求を通信開始時に消費せず、成功した応答だけを完了扱いにする
+- fresh要求中の通信失敗でも要求を失わない
+- 同じ失敗fresh要求でbusy-loopせず指数バックオフする
+- バックオフ中に新しいユーザーfresh要求が来た場合だけ即時wakeする
+- `invalid_session` / rate limit / viewer limit / protocol mismatch 等をWi-Fi障害と誤表示しない
+- permanent protocol error と retryable server/transport error を分類する
+
+### NSD / LAN防御
+
+- Android 14+ の `ServiceInfoCallback` 経路も32サービス上限へ含める
+- queue / resolved peer / callback / delayed retry を一つの総数上限として扱う
+- lost-service tombstone をTTL・件数上限付きにする
+- delayed retry Runnable を名前単位で管理し、stop/lost時に明示キャンセルする
+- Android 17 / targetSdk 37 移行用に `ACCESS_LOCAL_NETWORK` を先行宣言する
+- 現在はtargetSdk 36の互換挙動を維持する
+
+### Turbo
+
+- Turboは現在表示中の端末へ適用する
+- リモート表示中にローカル端末まで不要に5秒サンプリングし続けない
+- ローカルへ戻ればTurbo設定をローカルSamplerへ反映する
+
+### APK署名 / ビルド
+
+- versionCodeを4から5、versionNameを1.3.0から1.3.1へ更新
+- release署名鍵をrepository内で自動生成しない
+- 配布用release APKは明示した長期保管keystoreがある場合だけ生成する
+- release鍵未設定時は開発署名の `BatteryRelay-1.3.1-dev.apk` として明確に分離する
+- 既存 `.dev-signing.jks` の旧aliasとの互換性を維持する
+- build-tools 35.0.0固定を廃止し、36.0.0優先 + 利用可能な最新版自動検出へ変更する
+
+## 暗号・入力境界
+
+既存の防御を維持したまま、以下の対象を継続検査します。
+
+- P-256 ECDH
+- HKDF-SHA-256
+- AES-256-GCM
+- sequence/AADによる再利用拒否
+- 非P-256公開鍵拒否
+- 128-bit共有キー
+- pair replay制限
+- session sequence単調増加
+- 同時session/connection上限
+- IP単位rate limit
+- JSON depth / line-size制限
+
+## 実機二台でのみ残る確認
+
+CIのAndroid Emulatorでは次を完全には再現できません。
+
+- メーカー固有のバッテリー温度・電流・残容量・thermal statusの品質
+- Xiaomi等OEM独自のバックグラウンド/省電力制御
+- 実際の画面消灯・Dozeを長時間継続した際の消費電力
+- 物理端末二台間のmDNS / DNS-SD discovery
+- ルーターのAP isolation / multicast制限
+- VPN・モバイル回線・複数Wi-Fiが同時に存在する実環境でのNetwork binding
+- targetSdk 37へ実際に上げた後のAndroid 17 `ACCESS_LOCAL_NETWORK` runtime permission UI
+- Normal/Turboの長時間電力・発熱比較
+
+これらは「既知のコードバグが残っている」という意味ではなく、Emulatorだけでは物理環境を保証できない範囲です。
+
+## 配布APKについて
+
+CIでは安全のためDebug APKだけを自動生成し、配布用release秘密鍵はGitHubへ保存しません。
+
+`build-local.sh` は次の二経路です。
+
+- 長期保管したrelease keystoreを明示: `dist/BatteryRelay-1.3.1.apk`
+- release keystore未設定: `dist/BatteryRelay-1.3.1-dev.apk`
+
+したがって、この検証記録にはrelease APKの固定SHA-256を捏造して記載しません。実際に配布するrelease APKを固定鍵で生成した時点で、その成果物のSHA-256を別途記録してください。
