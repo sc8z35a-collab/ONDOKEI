@@ -599,10 +599,12 @@ public final class ShareHost {
             }
             throw new ProtocolException("invalid_session");
         }
+        byte[] sessionKey = session.leaseKey();
+        if (sessionKey == null) throw new ProtocolException("invalid_session");
         String requestAadId = sessionId + "/" + seq;
         byte[] plaintext = null;
         try {
-            plaintext = CryptoBox.decrypt(session.key,
+            plaintext = CryptoBox.decrypt(sessionKey,
                     CryptoBox.unb64(request.getString("nonce")),
                     CryptoBox.unb64(request.getString("box")),
                     CryptoBox.aad("snapshot-request", requestAadId));
@@ -624,7 +626,7 @@ public final class ShareHost {
             JSONObject payload = snapshotJson(System.currentTimeMillis(), freshRequested,
                     freshApplied, seq);
             byte[] nonce = CryptoBox.randomBytes(CryptoBox.GCM_NONCE_BYTES);
-            byte[] box = CryptoBox.encrypt(session.key, nonce,
+            byte[] box = CryptoBox.encrypt(sessionKey, nonce,
                     payload.toString().getBytes(StandardCharsets.UTF_8),
                     CryptoBox.aad("snapshot-response", requestAadId));
             return new JSONObject().put("ok", true)
@@ -632,6 +634,7 @@ public final class ShareHost {
                     .put("box", CryptoBox.b64(box));
         } finally {
             if (plaintext != null) java.util.Arrays.fill(plaintext, (byte) 0);
+            java.util.Arrays.fill(sessionKey, (byte) 0);
         }
     }
 
@@ -649,10 +652,12 @@ public final class ShareHost {
             }
             throw new ProtocolException("invalid_session");
         }
+        byte[] sessionKey = session.leaseKey();
+        if (sessionKey == null) throw new ProtocolException("invalid_session");
         String aadId = sessionId + "/" + seq;
         byte[] plaintext = null;
         try {
-            plaintext = CryptoBox.decrypt(session.key,
+            plaintext = CryptoBox.decrypt(sessionKey,
                     CryptoBox.unb64(request.getString("nonce")),
                     CryptoBox.unb64(request.getString("box")),
                     CryptoBox.aad("logout-request", aadId));
@@ -662,6 +667,7 @@ public final class ShareHost {
             }
         } finally {
             if (plaintext != null) java.util.Arrays.fill(plaintext, (byte) 0);
+            java.util.Arrays.fill(sessionKey, (byte) 0);
         }
         if (sessions.remove(sessionId, session)) session.destroy();
         publishState();
@@ -972,15 +978,16 @@ public final class ShareHost {
         return text == null || text.trim().isEmpty() ? error.getClass().getSimpleName() : text;
     }
 
-    private static final class ViewerSession {
-        final byte[] key;
+    static final class ViewerSession {
+        private final byte[] key;
         final long createdElapsed;
-        volatile long lastSeen;
+        private long lastSeen;
         private long highestSequence;
         private long lastFreshElapsed = Long.MIN_VALUE;
         private long requestWindowStart;
         private int requestsInWindow;
-        private volatile boolean confirmed;
+        private boolean confirmed;
+        private boolean destroyed;
 
         ViewerSession(byte[] key, long now) {
             if (key == null) throw new IllegalArgumentException("session key required");
@@ -989,12 +996,16 @@ public final class ShareHost {
             this.lastSeen = now;
         }
 
+        synchronized byte[] leaseKey() {
+            return destroyed ? null : key.clone();
+        }
+
         synchronized boolean isSequenceFresh(long sequence) {
-            return sequence > highestSequence && sequence >= 1;
+            return !destroyed && sequence > highestSequence && sequence >= 1;
         }
 
         synchronized boolean acceptSequence(long sequence, long now, boolean countForRateLimit) {
-            if (sequence <= highestSequence || sequence < 1) return false;
+            if (destroyed || sequence <= highestSequence || sequence < 1) return false;
             if (countForRateLimit) {
                 if (requestWindowStart == 0L || now < requestWindowStart
                         || now - requestWindowStart >= 60_000L) {
@@ -1010,24 +1021,29 @@ public final class ShareHost {
             return true;
         }
 
-        boolean isExpired(long now) {
+        synchronized boolean isExpired(long now) {
+            if (destroyed) return true;
             if (now < createdElapsed || now < lastSeen) return false;
             return (!confirmed && now - createdElapsed > UNCONFIRMED_SESSION_MILLIS)
                     || now - lastSeen > SESSION_IDLE_MILLIS;
         }
 
         synchronized boolean canFresh(long now, long minimumInterval) {
-            return lastFreshElapsed == Long.MIN_VALUE || now < lastFreshElapsed
-                    || now - lastFreshElapsed >= minimumInterval;
+            return !destroyed && (lastFreshElapsed == Long.MIN_VALUE || now < lastFreshElapsed
+                    || now - lastFreshElapsed >= minimumInterval);
         }
 
         synchronized boolean commitFresh(long now, long minimumInterval) {
-            if (!canFresh(now, minimumInterval)) return false;
+            if (destroyed || !canFresh(now, minimumInterval)) return false;
             lastFreshElapsed = now;
             return true;
         }
 
-        void destroy() { java.util.Arrays.fill(key, (byte) 0); }
+        synchronized void destroy() {
+            if (destroyed) return;
+            destroyed = true;
+            java.util.Arrays.fill(key, (byte) 0);
+        }
     }
 
     private static final class AttemptCounter {
