@@ -34,7 +34,7 @@ public final class BatterySample {
         this.timestampMillis = timestampMillis;
         this.levelPercent = levelPercent < 0 ? -1 : Math.min(100, levelPercent);
         this.temperatureC = Double.isFinite(temperatureC)
-                && temperatureC >= MIN_TEMPERATURE_C && temperatureC < MAX_TEMPERATURE_C
+                && temperatureC >= MIN_TEMPERATURE_C && temperatureC <= MAX_TEMPERATURE_C
                 ? temperatureC : Double.NaN;
         this.remainingMah = finiteInRange(remainingMah, 0d, MAX_REMAINING_MAH)
                 ? remainingMah : Double.NaN;
@@ -71,6 +71,7 @@ public final class BatterySample {
     }
 
     public static BatterySample fromJson(JSONObject json) throws JSONException {
+        if (json == null) throw new JSONException("sample_missing");
         return new BatterySample(
                 json.getLong("t"),
                 json.getInt("battery"),
