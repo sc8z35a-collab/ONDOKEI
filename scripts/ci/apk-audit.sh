@@ -41,9 +41,11 @@ for permission in \
   android.permission.ACCESS_WIFI_STATE \
   android.permission.CHANGE_NETWORK_STATE \
   android.permission.CHANGE_WIFI_MULTICAST_STATE \
+  android.permission.WAKE_LOCK \
   android.permission.FOREGROUND_SERVICE \
   android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE \
-  android.permission.POST_NOTIFICATIONS; do
+  android.permission.POST_NOTIFICATIONS \
+  android.permission.ACCESS_LOCAL_NETWORK; do
   grep -Fq "$permission" "$report_dir/permissions.txt"
 done
 
