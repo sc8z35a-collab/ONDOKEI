@@ -12,6 +12,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
 import android.os.SystemClock;
@@ -25,7 +26,7 @@ import jp.rstlab.batteryrelay.core.SamplingPolicy;
 import jp.rstlab.batteryrelay.data.MeasurementRepository;
 import jp.rstlab.batteryrelay.model.BatterySample;
 
-/** User-visible continuous sampler. One database row is retained per minute for only 30 minutes. */
+/** User-visible continuous sampler with a 30-minute display/share history window. */
 public final class MonitorService extends Service {
     public static final String ACTION_START = "jp.rstlab.batteryrelay.action.START";
     public static final String ACTION_STOP = "jp.rstlab.batteryrelay.action.STOP";
@@ -37,6 +38,7 @@ public final class MonitorService extends Service {
     private static final long WAKE_LOCK_TIMEOUT_MILLIS = 10L * 60L * 1000L;
     private static final long WAKE_LOCK_RENEW_MILLIS = 5L * 60L * 1000L;
 
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private HandlerThread workerThread;
     private Handler worker;
     private MeasurementRepository repository;
@@ -46,6 +48,7 @@ public final class MonitorService extends Service {
     private volatile boolean sampling;
     private volatile boolean turbo;
     private boolean foregroundStarted;
+    private volatile boolean explicitStopInProgress;
     private volatile int lastThermalStatus = -1;
     private long lastNotificationAt;
     private volatile long samplingGeneration;
@@ -108,13 +111,11 @@ public final class MonitorService extends Service {
             BatteryRelayApp app = BatteryRelayApp.from(this);
             app.shareHost().stop();
             app.remoteDevices().disconnectAll();
-            stopSampling();
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            foregroundStarted = false;
-            stopSelf();
+            beginExplicitStop(startId);
             return START_NOT_STICKY;
         }
 
+        explicitStopInProgress = false;
         if (intent != null && ACTION_SET_TURBO.equals(intent.getAction())) {
             turbo = intent.getBooleanExtra(EXTRA_TURBO, false);
         }
@@ -146,8 +147,10 @@ public final class MonitorService extends Service {
             worker.removeCallbacks(sampleTask);
             worker.post(sampleTask);
         } else if (intent != null && (ACTION_REFRESH.equals(intent.getAction())
-                || ACTION_SET_TURBO.equals(intent.getAction()))) {
-            // User actions bypass the timer but remain serialized on the one background thread.
+                || (ACTION_SET_TURBO.equals(intent.getAction())
+                && BatteryRelayApp.from(this).remoteDevices().getActiveKey() == null))) {
+            // A remote-only Turbo toggle updates state but must not trigger an unnecessary local
+            // battery read. Local refresh/Turbo actions still bypass the timer on the worker.
             updateSamplingWakeLock(effectiveIntervalMillis());
             worker.removeCallbacks(sampleTask);
             worker.post(sampleTask);
@@ -155,12 +158,40 @@ public final class MonitorService extends Service {
         return START_STICKY;
     }
 
+    private void beginExplicitStop(int startId) {
+        if (explicitStopInProgress) return;
+        explicitStopInProgress = true;
+        sampling = false;
+        samplingGeneration++;
+        if (repository != null) repository.setSamplingActive(false);
+        Handler background = worker;
+        if (background != null) {
+            background.removeCallbacksAndMessages(null);
+        }
+        releaseSamplingWakeLock();
+
+        Runnable finish = () -> {
+            try {
+                if (repository != null) repository.flushPending();
+            } finally {
+                mainHandler.post(() -> {
+                    stopForeground(STOP_FOREGROUND_REMOVE);
+                    foregroundStarted = false;
+                    stopSelfResult(startId);
+                });
+            }
+        };
+        if (background != null) background.post(finish);
+        else finish.run();
+    }
+
     @Override
     public void onDestroy() {
         BatteryRelayApp app = BatteryRelayApp.from(this);
         app.shareHost().stop();
         app.remoteDevices().disconnectAll();
-        stopSampling();
+        if (!explicitStopInProgress) stopSampling();
+        else releaseSamplingWakeLock();
         if (workerThread != null) workerThread.quitSafely();
         super.onDestroy();
     }
@@ -175,6 +206,8 @@ public final class MonitorService extends Service {
         samplingGeneration++;
         if (repository != null) {
             repository.setSamplingActive(false);
+            // OS-driven teardown cannot be delayed safely; keep this as best-effort. Explicit user
+            // stop uses beginExplicitStop(), which completes the flush before stopSelfResult().
             BatteryRelayApp.from(this).executeIo(repository::flushPending);
         }
         if (worker != null) worker.removeCallbacksAndMessages(null);
@@ -182,8 +215,6 @@ public final class MonitorService extends Service {
     }
 
     private static boolean needsContinuousWakeLock(long intervalMillis) {
-        // In explicit power/thermal protection mode, keeping the CPU awake defeats the purpose of
-        // backing off to 60 seconds and can itself bias battery temperature/current measurements.
         return intervalMillis < SamplingPolicy.BACKGROUND_INTERVAL_MILLIS;
     }
 
@@ -203,9 +234,7 @@ public final class MonitorService extends Service {
         try {
             if (lock.isHeld()) lock.release();
             if (sampling) lock.acquire(WAKE_LOCK_TIMEOUT_MILLIS);
-        } catch (RuntimeException ignored) {
-            // Sampling can still proceed while awake even on an OEM that rejects the lock.
-        }
+        } catch (RuntimeException ignored) {}
     }
 
     private void releaseSamplingWakeLock() {
@@ -218,9 +247,7 @@ public final class MonitorService extends Service {
         if (lock == null) return;
         try {
             if (lock.isHeld()) lock.release();
-        } catch (RuntimeException ignored) {
-            // Process death also releases kernel wakelocks; never crash during teardown.
-        }
+        } catch (RuntimeException ignored) {}
     }
 
     private void createNotificationChannel() {
@@ -238,9 +265,7 @@ public final class MonitorService extends Service {
         boolean powerSave = false;
         try {
             powerSave = powerManager != null && powerManager.isPowerSaveMode();
-        } catch (RuntimeException ignored) {
-            // A vendor service failure must not terminate the sampling worker.
-        }
+        } catch (RuntimeException ignored) {}
         boolean localTurbo = turbo
                 && BatteryRelayApp.from(this).remoteDevices().getActiveKey() == null;
         return SamplingPolicy.localInterval(localTurbo, powerSave, lastThermalStatus);
@@ -261,17 +286,17 @@ public final class MonitorService extends Service {
         if (sample == null) {
             content = "初回データを取得しています";
         } else if (sample.levelPercent < 0 && sample.hasTemperature()) {
-            content = String.format(Locale.JAPAN, "残量取得不可 ・ %.1f℃ ・ 30分のみ保存%s",
+            content = String.format(Locale.JAPAN, "残量取得不可 ・ %.1f℃ ・ 表示履歴30分%s",
                     sample.temperatureC,
                     BatteryRelayApp.from(this).shareHost().isRunning() ? " ・ 共有中" : "");
         } else if (sample.levelPercent < 0) {
-            content = "残量・温度取得不可 ・ 30分のみ保存";
+            content = "残量・温度取得不可 ・ 表示履歴30分";
         } else if (sample.hasTemperature()) {
-            content = String.format(Locale.JAPAN, "残量 %d%% ・ %.1f℃ ・ 30分のみ保存%s",
+            content = String.format(Locale.JAPAN, "残量 %d%% ・ %.1f℃ ・ 表示履歴30分%s",
                     sample.levelPercent, sample.temperatureC,
                     BatteryRelayApp.from(this).shareHost().isRunning() ? " ・ 共有中" : "");
         } else {
-            content = String.format(Locale.JAPAN, "残量 %d%% ・ 温度取得不可 ・ 30分のみ保存%s",
+            content = String.format(Locale.JAPAN, "残量 %d%% ・ 温度取得不可 ・ 表示履歴30分%s",
                     sample.levelPercent,
                     BatteryRelayApp.from(this).shareHost().isRunning() ? " ・ 共有中" : "");
         }
