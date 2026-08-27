@@ -34,14 +34,10 @@ public final class MeasurementRepository {
     private volatile boolean samplingActive;
     private long lastSampleElapsed = Long.MIN_VALUE;
     private final AtomicLong sampleRevision = new AtomicLong();
-    private final long timelineWallAnchor;
-    private final long timelineElapsedAnchor;
 
     public MeasurementRepository(Context context) {
         reader = new BatteryReader(context);
         store = new HistoryStore(context);
-        timelineWallAnchor = System.currentTimeMillis();
-        timelineElapsedAnchor = SystemClock.elapsedRealtime();
     }
 
     /** Loads/prunes persisted state away from the Android main thread. */
@@ -51,7 +47,7 @@ public final class MeasurementRepository {
     }
 
     public synchronized void initialize() {
-        long now = timelineNow();
+        long now = System.currentTimeMillis();
         try {
             List<BatterySample> loaded = store.readWindow(now);
             if (liveSample != null) {
@@ -73,7 +69,7 @@ public final class MeasurementRepository {
     }
 
     public synchronized BatterySample sampleNow() {
-        long now = timelineNow();
+        long now = System.currentTimeMillis();
         BatterySample sample = reader.read(now);
         lastSampleElapsed = SystemClock.elapsedRealtime();
         long minute = Math.floorDiv(sample.timestampMillis, 60_000L);
@@ -105,7 +101,7 @@ public final class MeasurementRepository {
     }
 
     public synchronized void pruneNow() {
-        long now = timelineNow();
+        long now = System.currentTimeMillis();
         try {
             cached = store.readWindow(now);
         } catch (RuntimeException ignored) {
@@ -137,7 +133,7 @@ public final class MeasurementRepository {
     /** Flushes the latest minute on an explicit service stop without changing the live cache. */
     public synchronized void flushPending() {
         if (pendingPersistentSample != null) enqueueForPersistence(pendingPersistentSample);
-        if (flushBacklog(timelineNow())) pendingPersistentSample = null;
+        if (flushBacklog(System.currentTimeMillis())) pendingPersistentSample = null;
     }
 
     public void setSamplingActive(boolean active) {
@@ -183,15 +179,5 @@ public final class MeasurementRepository {
             // Retain the bounded backlog in memory and retry at the next minute boundary/stop.
             return false;
         }
-    }
-
-    /**
-     * Monotonic wall-like timeline. Manual/NTP wall-clock jumps during this process therefore do
-     * not make valid samples suddenly appear to be in the future or expire the whole 30-min window.
-     */
-    private long timelineNow() {
-        long delta = Math.max(0L, SystemClock.elapsedRealtime() - timelineElapsedAnchor);
-        if (timelineWallAnchor > Long.MAX_VALUE - delta) return Long.MAX_VALUE;
-        return timelineWallAnchor + delta;
     }
 }
