@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Battery Relay</string>
+    <string name="notification_channel_name">30分モニター</string>
+    <string name="notification_channel_description">電池残量とバッテリー温度を30分だけ記録します</string>
+    <string name="notification_title">Battery Relay 計測中</string>
+    <string name="notification_stop">計測を停止</string>
+</resources>

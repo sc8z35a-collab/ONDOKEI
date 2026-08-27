@@ -1,0 +1,59 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'jp.rstlab.batteryrelay'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'jp.rstlab.batteryrelay'
+        minSdk 26
+        targetSdk 36
+        versionCode 4
+        versionName '1.3.0'
+    }
+
+    signingConfigs {
+        release {
+            storeFile file('../.dev-signing.jks')
+            storePassword System.getenv('BATTERY_RELAY_STORE_PASSWORD') ?: 'batteryrelay-dev'
+            keyAlias System.getenv('BATTERY_RELAY_KEY_ALIAS') ?: 'battery-relay'
+            keyPassword System.getenv('BATTERY_RELAY_KEY_PASSWORD') ?: storePassword
+            enableV1Signing false
+            enableV2Signing true
+            enableV3Signing true
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix '.debug'
+            versionNameSuffix '-debug'
+        }
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        // Java 8 bytecode keeps the APK broadly compatible and avoids adding
+        // any runtime dependency for language features the app does not use.
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError true
+        checkReleaseBuilds true
+        // API 36 is intentional: AGP 8.13's supported maximum and Android 17
+        // grants target-36 apps local-network access through INTERNET compatibility.
+        disable 'GradleDependency', 'OldTargetApi'
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}
