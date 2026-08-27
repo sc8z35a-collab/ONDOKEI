@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Restore executable bits
-        run: chmod +x gradlew scripts/ci/*.sh
+        run: chmod +x gradlew build-local.sh scripts/ci/*.sh
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -52,6 +52,13 @@ jobs:
         run: bash scripts/ci/apk-audit.sh app/build/outputs/apk/debug/app-debug.apk artifacts/static-audit-debug jp.rstlab.batteryrelay.debug
       - name: Verify release-path APK with disposable CI key
         run: bash scripts/ci/apk-audit.sh app/build/outputs/apk/release/app-release.apk artifacts/static-audit-release jp.rstlab.batteryrelay
+      - name: Build and audit documented distribution path
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-local.sh
+          test -s dist/BatteryRelay-1.3.1.apk
+          bash scripts/ci/apk-audit.sh dist/BatteryRelay-1.3.1.apk artifacts/static-audit-build-local jp.rstlab.batteryrelay
       - name: Record exact verified revision
         run: |
           mkdir -p artifacts/verification
@@ -64,6 +71,7 @@ jobs:
           cp -R app/build/reports/. artifacts/gradle-reports/ 2>/dev/null || true
           cp app/build/outputs/apk/debug/app-debug.apk artifacts/apks/ 2>/dev/null || true
           cp app/build/outputs/apk/release/app-release.apk artifacts/apks/app-ci-release-test-key.apk 2>/dev/null || true
+          cp dist/BatteryRelay-1.3.1.apk artifacts/apks/app-build-local-ci-test-key.apk 2>/dev/null || true
           cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk artifacts/apks/ 2>/dev/null || true
       - name: Upload build and static audit artifacts
         if: always()
