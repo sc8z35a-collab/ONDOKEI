@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Restore executable bits
+        run: chmod +x gradlew scripts/ci/*.sh
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
