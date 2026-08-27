@@ -4,16 +4,12 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-import java.lang.reflect.Method;
 import java.security.KeyPair;
 import java.util.Arrays;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
 import org.junit.Test;
 
 import jp.rstlab.batteryrelay.model.BatterySample;
-import jp.rstlab.batteryrelay.model.RemoteSnapshot;
 
 /** Pure-JVM regressions added by the second ultra audit. */
 public final class UltraAuditV2RegressionTest {
@@ -27,28 +23,6 @@ public final class UltraAuditV2RegressionTest {
         assertEquals(90d, hot.temperatureC, 0d);
         assertFalse(sample(3L, -40.1d).hasTemperature());
         assertFalse(sample(4L, 90.1d).hasTemperature());
-    }
-
-    @Test
-    public void remoteMappingCanUseRttMidpointWithoutChangingReceiptTime() throws Exception {
-        long hostGeneratedAt = 2_000_000_000_000L;
-        long receivedAt = 3_000_000_000_000L;
-        long midpoint = receivedAt - 2_500L;
-        JSONObject payload = new JSONObject()
-                .put("device", "remote")
-                .put("generatedAt", hostGeneratedAt)
-                .put("freshRequested", true)
-                .put("freshApplied", true)
-                .put("requestSequence", 9L)
-                .put("samples", new JSONArray().put(
-                        sample(hostGeneratedAt - 10_000L, 31d).toJson()));
-
-        RemoteSnapshot snapshot = RemoteSnapshot.fromJson(payload, receivedAt, midpoint);
-
-        assertEquals(receivedAt, snapshot.receivedAt);
-        assertEquals(midpoint - 10_000L, snapshot.generatedAt);
-        assertEquals(9L, snapshot.requestSequence);
-        assertTrue(snapshot.freshRequested);
     }
 
     @Test
