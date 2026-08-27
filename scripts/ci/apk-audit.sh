@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-apk="${1:?usage: apk-audit.sh APK [REPORT_DIR]}"
+apk="${1:?usage: apk-audit.sh APK [REPORT_DIR] [EXPECTED_PACKAGE]}"
 report_dir="${2:-artifacts/static-audit}"
-expected_package="jp.rstlab.batteryrelay.debug"
+expected_package="${3:-jp.rstlab.batteryrelay.debug}"
 mkdir -p "$report_dir"
 
 latest_tool() {
