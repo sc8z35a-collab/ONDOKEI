@@ -24,7 +24,7 @@ assert_activity() {
 }
 
 adb wait-for-device
-adb logcat -c
+adb logcat -c || true
 adb logcat -b crash -c || true
 adb install -r -t "$apk" | tee "$report_dir/install.txt"
 

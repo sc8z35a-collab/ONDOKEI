@@ -26,7 +26,9 @@ printf 'Running ONDOKEI system audit on Android API %s\n' "$api_level"
 
 adb install -r -t "$app_apk"
 adb install -r -t "$test_apk"
-adb shell pm grant "$package" android.permission.POST_NOTIFICATIONS || true
+if (( api_level >= 33 )); then
+  adb shell pm grant "$package" android.permission.POST_NOTIFICATIONS || true
+fi
 
 timeout --foreground 12m adb shell am instrument -w -r \
   -e disableAnalytics true \
