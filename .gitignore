@@ -1,5 +1,6 @@
 .gradle/
 .local-build/
+.local-test/
 **/build/
 local.properties
 *.jks
