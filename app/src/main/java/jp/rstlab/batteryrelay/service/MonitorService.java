@@ -115,8 +115,8 @@ public final class MonitorService extends Service {
             return START_NOT_STICKY;
         }
 
-        // Any new non-stop command supersedes a pending shutdown generation. If a flush from that
-        // older STOP completes later, it can no longer remove this run's foreground notification.
+        // Any new non-stop command supersedes a pending/completed shutdown generation. If a flush
+        // from an older STOP completes later, it can no longer remove this run's foreground state.
         explicitStopState.cancel();
         if (intent != null && ACTION_SET_TURBO.equals(intent.getAction())) {
             turbo = intent.getBooleanExtra(EXTRA_TURBO, false);
@@ -186,9 +186,10 @@ public final class MonitorService extends Service {
     }
 
     private void completeExplicitStop(long stopGeneration) {
-        // onStartCommand() and this callback share the main thread. A newer non-stop command first
-        // cancels the state generation, making the stale completion a no-op.
-        int stopStartId = explicitStopState.completionStartId(stopGeneration);
+        // Claiming moves the state out of "in progress" before teardown. A STOP that arrives after
+        // this callback therefore starts a fresh generation instead of being swallowed before
+        // onDestroy; a START cancels the completed ownership and restarts foreground normally.
+        int stopStartId = explicitStopState.claimCompletionStartId(stopGeneration);
         if (stopStartId < 0) return;
         stopForeground(STOP_FOREGROUND_REMOVE);
         foregroundStarted = false;
@@ -200,7 +201,7 @@ public final class MonitorService extends Service {
         BatteryRelayApp app = BatteryRelayApp.from(this);
         app.shareHost().stop();
         app.remoteDevices().disconnectAll();
-        if (!explicitStopState.isInProgress()) stopSampling();
+        if (!explicitStopState.ownsShutdown()) stopSampling();
         else releaseSamplingWakeLock();
         if (workerThread != null) workerThread.quitSafely();
         super.onDestroy();
